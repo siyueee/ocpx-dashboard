@@ -286,11 +286,13 @@ if uploaded_file:
         # 🚀 渲染页面
         st.subheader("1️⃣ 配置号汇总")
         res1, w1 = process_view(["广告主平台配置名称"])
-        style_and_display(res1, ["广告主平台配置名称"] + (["日期"] if show_daily else []), w1)
+        display_res1 = res1.head(300) 
+        style_and_display(display_res1, ["广告主平台配置名称"] + (["日期"] if show_daily else []), w1)
         st.divider()
 
         st.subheader("2️⃣ 媒体平台表现")
         f_df = df.copy()
+        
         if isinstance(selected_date_range, (list, tuple)) and len(selected_date_range) == 2:
             f_df = f_df[(f_df['日期'] >= selected_date_range[0]) & (f_df['日期'] <= selected_date_range[1])]
         if t_configs: f_df = f_df[f_df["广告主平台配置名称"].isin(t_configs)]
