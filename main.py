@@ -286,7 +286,7 @@ if uploaded_file:
         # 🚀 渲染页面
         st.subheader("1️⃣ 配置号汇总")
         res1, w1 = process_view(["广告主平台配置名称"])
-        display_res1 = res1.head(300) 
+        display_res1 = res1.head(700) 
         style_and_display(display_res1, ["广告主平台配置名称"] + (["日期"] if show_daily else []), w1)
         st.divider()
 
