@@ -9,7 +9,7 @@ st.title("📊 OCPX 业务数据全维度分析看板")
 # --- 预设指标池 ---
 PRESET_RATES = {
     "下单率": ("下单量", "广告主激活量"),
-    "次留率": ("次日回访量", "前日激活"),
+    "次留率": ("次日回访量", "广告主激活量"),
     "激活率": ("广告主激活量", "上报广告主次数"),
     "唤醒率": ("唤醒量", "上报广告主次数"),
     "首唤率": ("首唤量", "上报广告主次数"),
@@ -152,8 +152,14 @@ if uploaded_file:
 
                 if show_daily:
                     daily = f_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
+
+                    # --- 【核心修正：在合并前处理次留对齐】 ---
+                    # 确保日期升序，这样 shift(-1) 永远是取“明天”的回访
+                    daily = daily.sort_values(by=dims + ["日期"], ascending=True)
+                    # 关键：计算一个临时的对齐分子，只在纯净的 daily 表里操作
+                    daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
+
                     if enable_wow and wow_targets:
-                        daily = daily.sort_values(by=dims + ["日期"])
                         for col in wow_targets:
                             daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
 
@@ -163,6 +169,7 @@ if uploaded_file:
                         row = summary.iloc[[i]]
                         mask = True
                         for d in dims: mask &= (daily[d] == row[d].iloc[0])
+                        # 拼接时保持你想要的降序显示
                         combined.append(pd.concat([row, daily[mask].sort_values(by="日期", ascending=False)]))
                     final = pd.concat(combined, ignore_index=True) if combined else summary
                 else:
@@ -184,8 +191,16 @@ if uploaded_file:
                         denominator = pd.to_numeric(final[d], errors='coerce').fillna(0)
 
                         if name == "次留率":
-                            final[name] = np.where(denominator > 0, (numerator / denominator) * 100, 0.0)
+                            # 只有分日明细行需要对齐，汇总行直接相除即可
+                            if "_tmp_next_stay" in final.columns:
+                                is_daily = (final["日期"] != "✨ 汇总")
+                                # 明细行用拉取过来的“明天回访”，汇总行用“总回访”
+                                actual_n = np.where(is_daily, final["_tmp_next_stay"], numerator)
+                                final[name] = np.where(denominator > 0, (actual_n / denominator) * 100, 0.0)
+                            else:
+                                final[name] = np.where(denominator > 0, (numerator / denominator) * 100, 0.0)
                         else:
+                            # 其他指标保持正常逻辑
                             final[name] = np.where(denominator != 0, (numerator / denominator) * 100, 0.0)
                     else:
                         final[name] = 0.0
@@ -286,13 +301,13 @@ if uploaded_file:
         # 🚀 渲染页面
         st.subheader("1️⃣ 配置号汇总")
         res1, w1 = process_view(["广告主平台配置名称"])
-        display_res1 = res1.head(700) 
+        display_res1 = res1.head(700)
         style_and_display(display_res1, ["广告主平台配置名称"] + (["日期"] if show_daily else []), w1)
         st.divider()
 
         st.subheader("2️⃣ 媒体平台表现")
         f_df = df.copy()
-        
+
         if isinstance(selected_date_range, (list, tuple)) and len(selected_date_range) == 2:
             f_df = f_df[(f_df['日期'] >= selected_date_range[0]) & (f_df['日期'] <= selected_date_range[1])]
         if t_configs: f_df = f_df[f_df["广告主平台配置名称"].isin(t_configs)]
