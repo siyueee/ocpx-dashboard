@@ -2,9 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# 1. 基础配置
-st.set_page_config(page_title="OCPX看板", layout="wide")
-st.title("📊 OCPX 业务数据全维度分析看板")
+# 1. 基础网页配置（设定主题色与标题）
+st.set_page_config(page_title="OCPX业务数据全维度分析看板", layout="wide", initial_sidebar_state="expanded")
+
+# 顶部业务主标题（带装饰线）
+st.markdown("<h2 style='text-align: center; color: #1F77B4;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #666;'>欢迎提出使用建议~🍦</p>", unsafe_allow_html=True)
+st.divider()
 
 # --- 预设指标池 ---
 PRESET_RATES = {
@@ -19,34 +23,49 @@ PRESET_RATES = {
 }
 
 
-# --- 🚀 核心加速逻辑：数据加载缓存 ---
-@st.cache_data(ttl=3600)
+# --- 🚀 OCPX 专属高性能 Excel/CSV 数据加载引擎 ---
 def load_and_clean_data(file):
     if file.name.endswith('.csv'):
         try:
             raw_df = pd.read_csv(file, encoding='utf_8_sig')
         except:
-            raw_df = pd.read_csv(file, encoding='gbk')
+            try:
+                raw_df = pd.read_csv(file, encoding='gbk')
+            except:
+                raw_df = pd.read_csv(file, encoding='gb18030')
     else:
-        raw_df = pd.read_excel(file)
+        try:
+            raw_df = pd.read_excel(file, engine='calamine')
+        except Exception as e:
+            raw_df = pd.read_excel(file)
+
+    raw_df.columns = raw_df.columns.str.strip()
 
     def clean_name(x):
-        if pd.isna(x): return x
-        s = str(x)
+        if pd.isna(x): return "未知"
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan": return "未知"
         return s.split('_', 1)[-1] if '_' in s else s
 
-    for col in ['媒体平台名称', '广告主平台配置名称']:
+    if '广告主平台名称' not in raw_df.columns and '广告主平台' in raw_df.columns:
+        raw_df.rename(columns={'广告主平台': '广告主平台名称'}, inplace=True)
+
+    cols_to_clean = ['广告主平台名称', '媒体平台名称', '广告主平台配置名称']
+    for col in cols_to_clean:
         if col in raw_df.columns:
             raw_df[col] = raw_df[col].apply(clean_name)
+        else:
+            raw_df[col] = "未分类"
 
     if '调度中心ID' in raw_df.columns:
-        raw_df['调度中心ID'] = raw_df['调度中心ID'].astype(str).str.replace('.0', '', regex=False)
+        raw_df['调度中心ID'] = raw_df['调度中心ID'].astype(str).str.replace('.0', '', regex=False).str.strip().fillna("未关联ID")
+    else:
+        raw_df['调度中心ID'] = "未关联ID"
 
-    raw_df['日期'] = pd.to_datetime(raw_df['日期']).dt.date
+    raw_df['日期'] = pd.to_datetime(raw_df['日期'], errors='coerce').dt.date
 
-    # 预计算用于“环比”和“次留”的前置数据
     if '广告主激活量' in raw_df.columns:
-        sort_cols = [c for c in ["广告主平台配置名称", "媒体平台名称", "调度中心ID", "日期"] if c in raw_df.columns]
+        sort_cols = [c for c in ["广告主配置名称", "媒体平台名称", "调度中心ID", "日期"] if c in raw_df.columns]
         raw_df = raw_df.sort_values(by=sort_cols)
         group_cols = [c for c in sort_cols if c != '日期']
         raw_df['前日激活'] = raw_df.groupby(group_cols)['广告主激活量'].shift(1)
@@ -56,20 +75,97 @@ def load_and_clean_data(file):
     return raw_df
 
 
-uploaded_file = st.file_uploader("上传报表", type=["csv", "xlsx"])
+# --- 🔒 Session 状态内存锁 ---
+if "cleaned_data" not in st.session_state:
+    st.session_state["cleaned_data"] = None
+if "file_name" not in st.session_state:
+    st.session_state["file_name"] = None
+
+uploaded_file = st.file_uploader("📥 上传原始报表数据 (支持 .xlsx / .csv)", type=["csv", "xlsx"])
 
 if uploaded_file:
+    if st.session_state["file_name"] != uploaded_file.name:
+        with st.status("🚀 正在激活云端计算引擎并清洗大盘数据...", expanded=True) as status:
+            st.write("📦 正在识别文件格式与字符集编码...")
+            cleaned_df = load_and_clean_data(uploaded_file)
+            st.write("🧹 正在执行流失维度空值防御和去重对齐...")
+            st.session_state["cleaned_data"] = cleaned_df
+            st.session_state["file_name"] = uploaded_file.name
+            # 🛠️ 修复核心：让加载箱在完成后自动收起、打勾，防止“死循环打转”的视觉错觉
+            status.update(label="✅ 数据分析锁加载完成，可以开始筛选下钻！", state="complete", expanded=False)
+        st.toast(f"成功加载文件: {uploaded_file.name}", icon="🔥")
+
+# 只有当全局 Session 状态里确实存在数据时，才向下渲染看板
+if st.session_state["cleaned_data"] is not None:
     try:
-        df = load_and_clean_data(uploaded_file)
+        df = st.session_state["cleaned_data"]
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
 
-        # --- 侧边栏 ---
+        # --- 侧边栏配置区 ---
         with st.sidebar:
-            st.header("📅 时间维度")
-            selected_date_range = st.date_input("选择周期", value=(df['日期'].min(), df['日期'].max()))
+            # 🔄 优化：把漏斗四级动态联动筛选直接调到最上方
+            st.markdown("<h3 style='color: #1F77B4;'>🔍 漏斗动态筛选</h3>", unsafe_allow_html=True)
+
+            # 1. 广告主平台
+            platform_options = sorted(df["广告主平台名称"].unique().tolist())
+            select_all_plat = st.checkbox("🔗 全选所有平台", value=False)
+            t_platforms = st.multiselect(
+                "1. 广告主平台",
+                options=platform_options,
+                default=platform_options if select_all_plat else []
+            )
+
+            # 联动计算配置号
+            sub_df_for_config = df.copy()
+            if t_platforms:
+                sub_df_for_config = sub_df_for_config[sub_df_for_config["广告主平台名称"].isin(t_platforms)]
+            config_options = sorted(sub_df_for_config["广告主平台配置名称"].unique().tolist())
+
+            # 2. 配置号
+            select_all_config = st.checkbox("🔗 全选当前配置号", value=False)
+            t_configs = st.multiselect(
+                "2. 配置号筛选",
+                options=config_options,
+                default=config_options if select_all_config else []
+            )
+
+            # 联动计算媒体
+            sub_df_for_media = sub_df_for_config.copy()
+            if t_configs:
+                sub_df_for_media = sub_df_for_media[sub_df_for_media["广告主平台配置名称"].isin(t_configs)]
+            media_options = sorted(sub_df_for_media["媒体平台名称"].unique().tolist())
+
+            # 3. 媒体
+            select_all_media = st.checkbox("🔗 全选当前媒体", value=False)
+            t_media = st.multiselect(
+                "3. 媒体筛选",
+                options=media_options,
+                default=media_options if select_all_media else []
+            )
+
+            # 联动计算调度ID
+            sub_df_for_id = sub_df_for_media.copy()
+            if t_media:
+                sub_df_for_id = sub_df_for_id[sub_df_for_id["媒体平台名称"].isin(t_media)]
+            id_options = sorted(sub_df_for_id["调度中心ID"].unique().tolist())
+
+            # 4. 调度中心 ID 筛选
+            select_all_ids = st.checkbox("🔗 全选当前调度ID", value=False)
+            t_ids = st.multiselect(
+                "4. 调度中心ID筛选",
+                options=id_options,
+                default=id_options if select_all_ids else []
+            )
 
             st.divider()
-            st.header("📈 率指标 + 自定义CVR")
+            # 日期筛选移至第二顺位
+            st.markdown("<h3 style='color: #1F77B4;'>⏱️ 过滤基准</h3>", unsafe_allow_html=True)
+            valid_dates = df['日期'].dropna()
+            min_d, max_d = (valid_dates.min(), valid_dates.max()) if not valid_dates.empty else (None, None)
+            selected_date_range = st.date_input("选择周期范围", value=(min_d, max_d))
+
+            st.divider()
+            st.markdown("<h3 style='color: #1F77B4;'>📈 率指标池</h3>", unsafe_allow_html=True)
             selected_rate_names = []
             rate_keys = list(PRESET_RATES.keys())
             col1, col2 = st.columns(2)
@@ -79,9 +175,8 @@ if uploaded_file:
                     if st.checkbox(name, value=is_default):
                         selected_rate_names.append(name)
 
-            # 自定义CVR移入率指标区
             st.markdown("---")
-            show_cvr = st.checkbox("开启 自定义CVR", value=True)
+            show_cvr = st.checkbox("⚙️ 开启 自定义CVR", value=True)
             cvr_name = None
             if show_cvr:
                 c_num = st.selectbox("CVR 分子", numeric_cols,
@@ -90,18 +185,17 @@ if uploaded_file:
                     '上报广告主次数') if '上报广告主次数' in numeric_cols else 0)
                 cvr_name = f"CVR({c_num}/{c_den})"
 
-            # --- 💡 环比配置 ---
             st.divider()
-            st.header("🔄 环比配置")
+            st.markdown("<h3 style='color: #1F77B4;'>🔄 环比监控</h3>", unsafe_allow_html=True)
             enable_wow = st.toggle("开启指标环比 (对比前一日)", value=False)
             wow_targets = []
             if enable_wow:
-                wow_targets = st.multiselect("选择需要看环比的数值", numeric_cols,
+                wow_targets = st.multiselect("选择看环比的数值列", numeric_cols,
                                              default=[f for f in ["广告主激活量"] if f in numeric_cols])
 
             st.divider()
-            st.header("🚨 预警设置")
-            enable_alert = st.toggle("开启多指标预警", value=False)
+            st.markdown("<h3 style='color: #FF4B4B;'>🚨 多指标风控预警</h3>", unsafe_allow_html=True)
+            enable_alert = st.toggle("开启爆红预警高亮", value=False)
             alert_rules = []
             if enable_alert:
                 alert_targets_pool = list(selected_rate_names)
@@ -117,139 +211,163 @@ if uploaded_file:
                         with c_val: val = st.number_input("阈值(%)", value=5.0, step=0.1, key=f"val_{target}")
                         alert_rules.append({"target": target, "logic": logic, "val": val})
 
-            st.divider()
-            st.header("🔍 维度与筛选")
-            t_configs = st.multiselect("配置号筛选", options=df["广告主平台配置名称"].unique().tolist())
-            t_media = st.multiselect("媒体筛选", options=df["媒体平台名称"].unique().tolist())
-            s_metrics = st.multiselect("数值列", options=numeric_cols,
+            st.markdown("---")
+            s_metrics = st.multiselect("表内显示指标", options=numeric_cols,
                                        default=[f for f in ["广告主激活量", "新登量", "下单量"] if f in numeric_cols])
-            show_daily = st.checkbox("下钻分日", value=True)
+            show_daily = st.checkbox("开启下钻分日", value=True)
+
+        # --- 🛡️ 拦截未选完的日期 ---
+        if not isinstance(selected_date_range, (list, tuple)) or len(selected_date_range) < 2:
+            st.info("⏳ 请在左侧边栏选择完整的【开始日期】和【结束日期】...")
+            st.stop()
+
+        # --- ⚡ 核心全局精准过滤切片 ---
+        f_df_global = df.copy()
+        f_df_global = f_df_global[
+            (f_df_global['日期'] >= selected_date_range[0]) & (f_df_global['日期'] <= selected_date_range[1])]
+
+        if t_platforms:
+            f_df_global = f_df_global[f_df_global["广告主平台名称"].isin(t_platforms)]
+        if t_configs:
+            f_df_global = f_df_global[f_df_global["广告主平台配置名称"].isin(t_configs)]
+        if t_media:
+            f_df_global = f_df_global[f_df_global["媒体平台名称"].isin(t_media)]
+        if t_ids:
+            f_df_global = f_df_global[f_df_global["调度中心ID"].isin(t_ids)]
+
+        # ✨ 视觉装饰 1：顶层全局核心大牌 KPI 统计卡片
+        if not f_df_global.empty:
+            total_active = int(f_df_global["广告主激活量"].sum()) if "广告主激活量" in f_df_global.columns else 0
+            total_reg = int(f_df_global["新登量"].sum()) if "新登量" in f_df_global.columns else 0
+            total_order = int(f_df_global["下单量"].sum()) if "下单量" in f_df_global.columns else 0
+
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            with m_col1:
+                st.metric(label="🎯 选定周期总激活量", value=f"{total_active:,}")
+            with m_col2:
+                st.metric(label="👥 累计新登量", value=f"{total_reg:,}")
+            with m_col3:
+                st.metric(label="🛒 累计下单量", value=f"{total_order:,}")
+            with m_col4:
+                avg_rate = (total_order / total_active * 100) if total_active > 0 else 0.0
+                st.metric(label="📊 整体转化表现 (下单/激活)", value=f"{avg_rate:.2f}%")
+            st.divider()
 
 
-            # --- 计算逻辑 ---
-            def process_view(dims):
-                base_needed = list(s_metrics) + ["次日回访量"]
-                for r_name in PRESET_RATES: base_needed.extend(list(PRESET_RATES[r_name]))
-                if show_cvr: base_needed.extend([c_num, c_den])
+        # --- 核心计算引擎函数 ---
+        def process_view(dims, src_df):
+            if src_df.empty:
+                return pd.DataFrame(), []
 
-                agg_map = {c: 'sum' for c in set(base_needed) if c in df.columns}
-                if '前日激活' in df.columns: agg_map['前日激活'] = 'sum'
+            base_needed = list(s_metrics) + ["次日回访量"]
+            for r_name in PRESET_RATES: base_needed.extend(list(PRESET_RATES[r_name]))
+            if show_cvr: base_needed.extend([c_num, c_den])
 
-                f_df = df.copy()
-                if isinstance(selected_date_range, (list, tuple)) and len(selected_date_range) == 2:
-                    f_df = f_df[(f_df['日期'] >= selected_date_range[0]) & (f_df['日期'] <= selected_date_range[1])]
-                if t_configs: f_df = f_df[f_df["广告主平台配置名称"].isin(t_configs)]
-                if t_media: f_df = f_df[f_df["媒体平台名称"].isin(t_media)]
+            agg_map = {c: 'sum' for c in set(base_needed) if c in src_df.columns}
+            if '前日激活' in src_df.columns: agg_map['前日激活'] = 'sum'
 
-                # 强制转数值，避免空值/类型错误
-                for c in agg_map.keys():
-                    if c in f_df.columns:
-                        f_df[c] = pd.to_numeric(f_df[c], errors='coerce').fillna(0)
+            for c in agg_map.keys():
+                if c in src_df.columns:
+                    src_df[c] = pd.to_numeric(src_df[c], errors='coerce').fillna(0)
 
-                summary = f_df.groupby(dims).agg(agg_map).reset_index()
-                sort_target = [c for c in ["广告主激活量", "新登量"] if c in summary.columns]
-                if sort_target: summary = summary.sort_values(by=sort_target, ascending=False)
+            summary = src_df.groupby(dims).agg(agg_map).reset_index()
+            sort_target = [c for c in ["广告主激活量", "新登量"] if c in summary.columns]
+            if sort_target: summary = summary.sort_values(by=sort_target, ascending=False)
 
-                if show_daily:
-                    daily = f_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
+            if show_daily:
+                daily = src_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
+                daily = daily.sort_values(by=dims + ["日期"], ascending=True)
+                daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
 
-                    # --- 【核心修正：在合并前处理次留对齐】 ---
-                    # 确保日期升序，这样 shift(-1) 永远是取“明天”的回访
-                    daily = daily.sort_values(by=dims + ["日期"], ascending=True)
-                    # 关键：计算一个临时的对齐分子，只在纯净的 daily 表里操作
-                    daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
-
-                    if enable_wow and wow_targets:
-                        for col in wow_targets:
-                            daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
-
-                    summary["日期"] = "✨ 汇总"
-                    combined = []
-                    for i in range(len(summary)):
-                        row = summary.iloc[[i]]
-                        mask = True
-                        for d in dims: mask &= (daily[d] == row[d].iloc[0])
-                        # 拼接时保持你想要的降序显示
-                        combined.append(pd.concat([row, daily[mask].sort_values(by="日期", ascending=False)]))
-                    final = pd.concat(combined, ignore_index=True) if combined else summary
-                else:
-                    final = summary
-
-                # 总配置号汇总
-                if dims == ["广告主平台配置名称"]:
-                    total_row = f_df.agg(agg_map).to_frame().T
-                    for c in total_row.columns:
-                        if c in numeric_cols: total_row[c] = total_row[c].fillna(0).astype(int)
-                    total_row["广告主平台配置名称"] = "【全配置号汇总】"
-                    total_row["日期"] = "✨ 汇总"
-                    final = pd.concat([total_row, final], ignore_index=True)
-
-                # ===================== 【修复除法报错】 =====================
-                for name, (n, d) in PRESET_RATES.items():
-                    if n in final.columns and d in final.columns:
-                        numerator = pd.to_numeric(final[n], errors='coerce').fillna(0)
-                        denominator = pd.to_numeric(final[d], errors='coerce').fillna(0)
-
-                        if name == "次留率":
-                            # 只有分日明细行需要对齐，汇总行直接相除即可
-                            if "_tmp_next_stay" in final.columns:
-                                is_daily = (final["日期"] != "✨ 汇总")
-                                # 明细行用拉取过来的“明天回访”，汇总行用“总回访”
-                                actual_n = np.where(is_daily, final["_tmp_next_stay"], numerator)
-                                final[name] = np.where(denominator > 0, (actual_n / denominator) * 100, 0.0)
-                            else:
-                                final[name] = np.where(denominator > 0, (numerator / denominator) * 100, 0.0)
-                        else:
-                            # 其他指标保持正常逻辑
-                            final[name] = np.where(denominator != 0, (numerator / denominator) * 100, 0.0)
-                    else:
-                        final[name] = 0.0
-
-                # 自定义CVR
-                if show_cvr and c_num in final.columns and c_den in final.columns:
-                    num = pd.to_numeric(final[c_num], errors='coerce').fillna(0)
-                    den = pd.to_numeric(final[c_den], errors='coerce').fillna(0)
-                    final[cvr_name] = np.where(den != 0, (num / den) * 100, 0.0)
-                # ==============================================================
-
-                # 环比
-                wow_col_names = []
                 if enable_wow and wow_targets:
                     for col in wow_targets:
-                        p_col = f"prev_{col}"
-                        if p_col in final.columns:
-                            wow_col = f"{col}环比"
-                            is_real_date = (final["日期"] != "✨ 汇总")
-                            cur = pd.to_numeric(final[col], errors='coerce').fillna(0)
-                            pre = pd.to_numeric(final[p_col], errors='coerce').fillna(0)
-                            final[wow_col] = np.where(
-                                is_real_date & (pre != 0),
-                                ((cur - pre) / pre) * 100, 0.0
-                            )
-                            wow_col_names.append(wow_col)
+                        daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
 
-                # 整数格式化
-                for c in s_metrics:
-                    if c in final.columns:
-                        final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).astype(int)
+                summary["日期"] = "✨ 汇总"
+                combined = []
+                for i in range(len(summary)):
+                    row = summary.iloc[[i]]
+                    mask = True
+                    for d in dims: mask &= (daily[d] == row[d].iloc[0])
+                    combined.append(pd.concat([row, daily[mask].sort_values(by="日期", ascending=False)]))
+                final = pd.concat(combined, ignore_index=True) if combined else summary
+            else:
+                final = summary
 
-                return final, wow_col_names
+            if dims == ["广告主平台配置名称"] or dims == ["广告主平台名称", "广告主平台配置名称"]:
+                total_row = src_df.agg(agg_map).to_frame().T
+                for c in total_row.columns:
+                    if c in numeric_cols: total_row[c] = total_row[c].fillna(0).astype(int)
+                if "广告主平台名称" in dims: total_row["广告主平台名称"] = "【全大盘汇总】"
+                total_row["广告主平台配置名称"] = "【全配置号汇总】"
+                total_row["日期"] = "✨ 汇总"
+                final = pd.concat([total_row, final], ignore_index=True)
+
+            # 率指标计算
+            for name, (n, d) in PRESET_RATES.items():
+                if n in final.columns and d in final.columns:
+                    numerator = pd.to_numeric(final[n], errors='coerce').fillna(0)
+                    denominator = pd.to_numeric(final[d], errors='coerce').fillna(0)
+
+                    if name == "次留率":
+                        if "_tmp_next_stay" in final.columns:
+                            is_daily = (final["日期"] != "✨ 汇总")
+                            actual_n = np.where(is_daily, final["_tmp_next_stay"], numerator)
+                            final[name] = np.where(denominator > 0, (actual_n / denominator) * 100, 0.0)
+                        else:
+                            final[name] = np.where(denominator > 0, (numerator / denominator) * 100, 0.0)
+                    else:
+                        final[name] = np.where(denominator != 0, (numerator / denominator) * 100, 0.0)
+                else:
+                    final[name] = 0.0
+
+            # CVR 计算
+            if show_cvr and c_num in final.columns and c_den in final.columns:
+                num = pd.to_numeric(final[c_num], errors='coerce').fillna(0)
+                den = pd.to_numeric(final[c_den], errors='coerce').fillna(0)
+                final[cvr_name] = np.where(den != 0, (num / den) * 100, 0.0)
+
+            # 环比计算
+            wow_col_names = []
+            if enable_wow and wow_targets:
+                for col in wow_targets:
+                    p_col = f"prev_{col}"
+                    if p_col in final.columns:
+                        wow_col = f"{col}环比"
+                        is_real_date = (final["日期"] != "✨ 汇总")
+                        cur = pd.to_numeric(final[col], errors='coerce').fillna(0)
+                        pre = pd.to_numeric(final[p_col], errors='coerce').fillna(0)
+                        final[wow_col] = np.where(
+                            is_real_date & (pre != 0),
+                            ((cur - pre) / pre) * 100, 0.0
+                        )
+                        wow_col_names.append(wow_col)
+
+            for c in s_metrics:
+                if c in final.columns:
+                    final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).astype(int)
+
+            return final, wow_col_names
 
 
+        # --- 前端样式与数据表格渲染引擎 ---
         def style_and_display(res_df, base_dims, wow_cols):
-            if res_df.empty: return st.info("无数据")
+            if res_df.empty: return st.info("所选筛选条件下无数据")
 
             table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + wow_cols
-            disp_cols = base_dims + [c for c in s_metrics if c in res_df.columns] + table_rates
+
+            actual_dims = [d for d in base_dims if d in res_df.columns]
+            actual_metrics = [c for c in s_metrics if c in res_df.columns]
+            actual_rates = [r for r in table_rates if r in res_df.columns]
+            disp_cols = actual_dims + actual_metrics + actual_rates
 
             def apply_style(row):
                 styles = ['' for _ in row]
-                if '【全配置号汇总】' in str(row.get('广告主平台配置名称', '')):
+                if '【全配置号汇总】' in str(row.get('广告主平台配置名称', '')) or '【全大盘汇总】' in str(row.get('广告主平台名称', '')):
                     styles = ['background-color: #FFF2CC; font-weight: bold; color: #D68910' for _ in styles]
                 elif '✨ 汇总' in str(row.get('日期', '')):
                     styles = ['background-color: #E6F3FF; font-weight: bold; color: #1f77b4' for _ in styles]
 
-                # 预警
                 if enable_alert:
                     for rule in alert_rules:
                         target, logi, threshold = rule['target'], rule['logic'], rule['val']
@@ -273,7 +391,6 @@ if uploaded_file:
                             except:
                                 pass
 
-                # 环比颜色
                 for w_col in wow_cols:
                     if w_col in disp_cols:
                         idx = disp_cols.index(w_col)
@@ -287,55 +404,63 @@ if uploaded_file:
                             pass
                 return styles
 
-            c_config = {"日期": st.column_config.TextColumn(width="small")}
-            for col in table_rates:
+            c_config = {}
+            if "日期" in disp_cols:
+                c_config["日期"] = st.column_config.TextColumn(width="small")
+            for col in actual_rates:
                 c_config[col] = st.column_config.NumberColumn(format="%.2f%%", width="small")
-            for col in s_metrics:
-                if col in disp_cols:
-                    c_config[col] = st.column_config.NumberColumn(format="%d")
+            for col in actual_metrics:
+                c_config[col] = st.column_config.NumberColumn(format="%d")
 
             st.dataframe(res_df[disp_cols].style.apply(apply_style, axis=1), use_container_width=True, hide_index=True,
                          column_config=c_config)
 
 
-        # 🚀 渲染页面
-        st.subheader("1️⃣ 配置号汇总")
-        res1, w1 = process_view(["广告主平台配置名称"])
-        display_res1 = res1.head(700)
-        style_and_display(display_res1, ["广告主平台配置名称"] + (["日期"] if show_daily else []), w1)
+        # 🚀 ==================== 页面层级动态维度对齐渲染 ====================
+
+        base_dims_v1 = ["广告主平台配置名称"]
+        if t_platforms or "广告主平台名称" in f_df_global.columns:
+            base_dims_v1 = ["广告主平台名称", "广告主平台配置名称"]
+
+        st.subheader("1️⃣ 配置号大盘分析汇总")
+        res1, w1 = process_view(base_dims_v1, f_df_global)
+        display_res1 = res1.head(700) if not res1.empty else res1
+        style_and_display(display_res1, base_dims_v1 + (["日期"] if show_daily else []), w1)
         st.divider()
 
-        st.subheader("2️⃣ 媒体平台表现")
-        f_df = df.copy()
+        st.subheader("2️⃣ 媒体平台明细")
+        if "媒体平台名称" in f_df_global.columns and not f_df_global.empty:
+            media_summary = f_df_global.groupby("媒体平台名称", dropna=True)["广告主激活量"].sum().reset_index().sort_values(
+                by="广告主激活量", ascending=False)
+            media_list_sorted = media_summary["媒体平台名称"].tolist()
+            st.markdown(
+                f"💡 当前筛选组合内共覆盖 **{len(media_list_sorted)}** 个媒体：`{' / '.join(media_list_sorted) if media_list_sorted else '无'}`")
+        else:
+            st.markdown("💡 共有媒体：0 个")
 
-        if isinstance(selected_date_range, (list, tuple)) and len(selected_date_range) == 2:
-            f_df = f_df[(f_df['日期'] >= selected_date_range[0]) & (f_df['日期'] <= selected_date_range[1])]
-        if t_configs: f_df = f_df[f_df["广告主平台配置名称"].isin(t_configs)]
-        if t_media: f_df = f_df[f_df["媒体平台名称"].isin(t_media)]
-        media_summary = f_df.groupby("媒体平台名称", dropna=True)["广告主激活量"].sum().reset_index().sort_values(
-            by="广告主激活量", ascending=False)
-        media_list_sorted = media_summary["媒体平台名称"].tolist()
-        st.markdown(
-            f"**📊 总数：{len(media_list_sorted)} 个** ｜ **📝 明细：{'、'.join(media_list_sorted) if media_list_sorted else '无'}**")
-        res2, w2 = process_view(["广告主平台配置名称", "媒体平台名称"])
-        style_and_display(res2, ["广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []), w2)
+        base_dims_v2 = base_dims_v1 + ["媒体平台名称"]
+        res2, w2 = process_view(base_dims_v2, f_df_global)
+        style_and_display(res2, base_dims_v2 + (["日期"] if show_daily else []), w2)
         st.divider()
 
-        st.subheader("3️⃣ 调度 ID 明细")
-        if "媒体平台名称" in f_df.columns and "调度中心ID" in f_df.columns:
-            media_id_count = f_df.groupby("媒体平台名称")["调度中心ID"].nunique().reset_index()
-            act_sum = f_df.groupby("媒体平台名称")["广告主激活量"].sum()
+        st.subheader("3️⃣ 调度ID明细")
+        if "媒体平台名称" in f_df_global.columns and "调度中心ID" in f_df_global.columns and not f_df_global.empty:
+            media_id_count = f_df_global.groupby("媒体平台名称")["调度中心ID"].nunique().reset_index()
+            act_sum = f_df_global.groupby("媒体平台名称")["广告主激活量"].sum()
             media_id_count["激活量"] = media_id_count["媒体平台名称"].map(act_sum)
             media_id_count = media_id_count.sort_values("激活量", ascending=False)
-            id_detail = "，".join(
-                [f"{row['媒体平台名称']}：{row['调度中心ID']}个" for _, row in media_id_count.iterrows()])
+            id_detail = " ｜ ".join(
+                [f"**{row['媒体平台名称']}** ({row['调度中心ID']}个)" for _, row in media_id_count.iterrows()])
         else:
             id_detail = "无数据"
-        st.markdown(f"**🆔 各媒体调度ID：{id_detail}**")
-        res3, w3 = process_view(["媒体平台名称", "调度中心ID"])
-        style_and_display(res3, ["媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []), w3)
+
+        st.markdown(f"🆔 各渠道下调度id分布：{id_detail}")
+        base_dims_v3 = ["媒体平台名称", "调度中心ID"]
+        res3, w3 = process_view(base_dims_v3, f_df_global)
+        style_and_display(res3, base_dims_v3 + (["日期"] if show_daily else []), w3)
 
     except Exception as e:
         st.error(f"处理出现技术错误: {e}")
 else:
-    st.info("👋 请上传报表使用")
+    st.info("👋 欢迎使用！请在上方上传 OCPX 业务数据报表!")
+    st.info("ps：可上传完整底表，无需筛选字段～")
