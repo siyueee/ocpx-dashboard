@@ -65,7 +65,7 @@ def load_and_clean_data(file):
     raw_df['日期'] = pd.to_datetime(raw_df['日期'], errors='coerce').dt.date
 
     if '广告主激活量' in raw_df.columns:
-        sort_cols = [c for c in ["广告主配置名称", "媒体平台名称", "调度中心ID", "日期"] if c in raw_df.columns]
+        sort_cols = [c for c in ["广告主平台配置名称", "媒体平台名称", "调度中心ID", "日期"] if c in raw_df.columns]
         raw_df = raw_df.sort_values(by=sort_cols)
         group_cols = [c for c in sort_cols if c != '日期']
         raw_df['前日激活'] = raw_df.groupby(group_cols)['广告主激活量'].shift(1)
@@ -91,7 +91,7 @@ if uploaded_file:
             st.write("🧹 正在执行流失维度空值防御和去重对齐...")
             st.session_state["cleaned_data"] = cleaned_df
             st.session_state["file_name"] = uploaded_file.name
-            # 🛠️ 修复核心：让加载箱在完成后自动收起、打勾，防止“死循环打转”的视觉错觉
+            # 🛠️ 智能加载箱状态更新闭环
             status.update(label="✅ 数据分析锁加载完成，可以开始筛选下钻！", state="complete", expanded=False)
         st.toast(f"成功加载文件: {uploaded_file.name}", icon="🔥")
 
@@ -103,7 +103,7 @@ if st.session_state["cleaned_data"] is not None:
 
         # --- 侧边栏配置区 ---
         with st.sidebar:
-            # 🔄 优化：把漏斗四级动态联动筛选直接调到最上方
+            # 🔄 顺位调整一：漏斗四级动态联动筛选直接调到最上方，符合运营排查业务的直觉
             st.markdown("<h3 style='color: #1F77B4;'>🔍 漏斗动态筛选</h3>", unsafe_allow_html=True)
 
             # 1. 广告主平台
@@ -158,7 +158,7 @@ if st.session_state["cleaned_data"] is not None:
             )
 
             st.divider()
-            # 日期筛选移至第二顺位
+            # 🔄 顺位调整二：日期筛选移至第二顺位
             st.markdown("<h3 style='color: #1F77B4;'>⏱️ 过滤基准</h3>", unsafe_allow_html=True)
             valid_dates = df['日期'].dropna()
             min_d, max_d = (valid_dates.min(), valid_dates.max()) if not valid_dates.empty else (None, None)
@@ -235,26 +235,8 @@ if st.session_state["cleaned_data"] is not None:
         if t_ids:
             f_df_global = f_df_global[f_df_global["调度中心ID"].isin(t_ids)]
 
-        # ✨ 视觉装饰 1：顶层全局核心大牌 KPI 统计卡片
-        if not f_df_global.empty:
-            total_active = int(f_df_global["广告主激活量"].sum()) if "广告主激活量" in f_df_global.columns else 0
-            total_reg = int(f_df_global["新登量"].sum()) if "新登量" in f_df_global.columns else 0
-            total_order = int(f_df_global["下单量"].sum()) if "下单量" in f_df_global.columns else 0
 
-            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            with m_col1:
-                st.metric(label="🎯 选定周期总激活量", value=f"{total_active:,}")
-            with m_col2:
-                st.metric(label="👥 累计新登量", value=f"{total_reg:,}")
-            with m_col3:
-                st.metric(label="🛒 累计下单量", value=f"{total_order:,}")
-            with m_col4:
-                avg_rate = (total_order / total_active * 100) if total_active > 0 else 0.0
-                st.metric(label="📊 整体转化表现 (下单/激活)", value=f"{avg_rate:.2f}%")
-            st.divider()
-
-
-        # --- 核心计算引擎函数 ---
+        # --- 🚀 核心计算引擎函数 (提前执行以供给 KPI 卡片提取精准的大盘率指标) ---
         def process_view(dims, src_df):
             if src_df.empty:
                 return pd.DataFrame(), []
@@ -350,6 +332,88 @@ if st.session_state["cleaned_data"] is not None:
             return final, wow_col_names
 
 
+        # 提前计算配置号大盘视图，确保顶层反射卡片能抓取到最精准的汇总率指标
+        base_dims_v1 = ["广告主平台配置名称"]
+        if t_platforms or "广告主平台名称" in f_df_global.columns:
+            base_dims_v1 = ["广告主平台名称", "广告主平台配置名称"]
+        res1, w1 = process_view(base_dims_v1, f_df_global)
+
+        # ✨ 视觉装饰 1：智能动态反射 KPI 卡片（完美兼容“有下单无新登”等各类特殊、缺失业务数据链）
+        if not f_df_global.empty:
+            active_kpi_pool = []
+
+            # ① 绝对数值指标追加（动态同步侧边栏）
+            for m_col in s_metrics:
+                if m_col in f_df_global.columns:
+                    active_kpi_pool.append({"name": m_col, "type": "number"})
+
+            # ② 率指标追加（动态同步侧边栏）
+            for r_name in selected_rate_names:
+                if r_name in PRESET_RATES:
+                    active_kpi_pool.append({"name": r_name, "type": "rate"})
+            if show_cvr and cvr_name:
+                active_kpi_pool.append({"name": cvr_name, "type": "rate"})
+
+            # ③ 兜底防御：若侧边栏全空，硬编码前两项防止报错空白
+            if not active_kpi_pool:
+                default_cols = [c for c in ["广告主激活量", "下单量", "新登量"] if c in f_df_global.columns]
+                for d_c in default_cols:
+                    active_kpi_pool.append({"name": d_c, "type": "number"})
+
+            # 取前 4 个激活指标渲染成大厂风高亮彩色卡片
+            display_kpis = active_kpi_pool[:4]
+            kpi_cols = st.columns(len(display_kpis))
+
+            card_colors = ["#1F77B4", "#FF7F0E", "#2CA02C", "#9467BD"]
+            card_style = """
+            <div style="
+                background-color: #F8F9FA; 
+                padding: 15px; 
+                border-radius: 8px; 
+                border-left: 5px solid {color}; 
+                box-shadow: 2px 2px 8px rgba(0,0,0,0.04);
+                text-align: left;">
+                <span style="font-size: 13px; color: #666666; font-weight: 500;">{label}</span>
+                <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px; font-family: -apple-system, sans-serif;">{value}</h3>
+            </div>
+            """
+
+            for idx, kpi in enumerate(display_kpis):
+                kpi_name = kpi["name"]
+                kpi_type = kpi["type"]
+                color = card_colors[idx % len(card_colors)]
+
+                with kpi_cols[idx]:
+                    if kpi_type == "number":
+                        val_sum = int(f_df_global[kpi_name].sum())
+                        st.markdown(card_style.format(label=f"📊 周期总 {kpi_name}", value=f"{val_sum:,}", color=color),
+                                    unsafe_allow_html=True)
+
+                    elif kpi_type == "rate":
+                        if 'res1' in locals() and not res1.empty and kpi_name in res1.columns:
+                            rate_val = res1[kpi_name].iloc[0]
+                        else:
+                            if kpi_name in PRESET_RATES:
+                                n_col, d_col = PRESET_RATES[kpi_name]
+                                n_sum = f_df_global[n_col].sum() if n_col in f_df_global.columns else 0
+                                d_sum = f_df_global[d_col].sum() if d_col in f_df_global.columns else 0
+                                rate_val = (n_sum / d_sum * 100) if d_sum > 0 else 0.0
+                            elif show_cvr and kpi_name == cvr_name:
+                                n_sum = f_df_global[c_num].sum() if c_num in f_df_global.columns else 0
+                                d_sum = f_df_global[c_den].sum() if c_den in f_df_global.columns else 0
+                                rate_val = (n_sum / d_sum * 100) if d_sum > 0 else 0.0
+                            else:
+                                rate_val = 0.0
+
+                        st.markdown(
+                            card_style.format(label=f"📈 大盘综合 {kpi_name}", value=f"{rate_val:.2f}%", color=color),
+                            unsafe_allow_html=True)
+            st.write("")
+            st.divider()
+        else:
+            st.warning("⚠️ 当前筛选组合下无数据，请检查侧边栏多选框是否勾选。")
+
+
         # --- 前端样式与数据表格渲染引擎 ---
         def style_and_display(res_df, base_dims, wow_cols):
             if res_df.empty: return st.info("所选筛选条件下无数据")
@@ -416,14 +480,9 @@ if st.session_state["cleaned_data"] is not None:
                          column_config=c_config)
 
 
-        # 🚀 ==================== 页面层级动态维度对齐渲染 ====================
-
-        base_dims_v1 = ["广告主平台配置名称"]
-        if t_platforms or "广告主平台名称" in f_df_global.columns:
-            base_dims_v1 = ["广告主平台名称", "广告主平台配置名称"]
+        # 🚀 ==================== 页面层级多维下钻对齐渲染 ====================
 
         st.subheader("1️⃣ 配置号大盘分析汇总")
-        res1, w1 = process_view(base_dims_v1, f_df_global)
         display_res1 = res1.head(700) if not res1.empty else res1
         style_and_display(display_res1, base_dims_v1 + (["日期"] if show_daily else []), w1)
         st.divider()
