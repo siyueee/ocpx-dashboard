@@ -181,6 +181,32 @@ def load_and_clean_data_cached(file_contents, file_name):
 
 
 # ==========================================
+# ⚡ 高性能内存级联过滤引擎（向量化加速，完美支撑百万行）
+# ==========================================
+@st.cache_data(show_spinner=False)
+def get_filtered_dataframe(base_df, start_date, end_date, factions, products, platforms, configs, media, ids):
+    """
+    将所有筛选条件作为不可变类型（Tuple）传入，触发底层内存缓存
+    """
+    mask = (base_df['日期'] >= start_date) & (base_df['日期'] <= end_date)
+
+    if factions:
+        mask &= base_df['派系'].isin(factions)
+    if products:
+        mask &= base_df['产品'].isin(products)
+    if platforms:
+        mask &= base_df['广告主平台名称'].isin(platforms)
+    if configs:
+        mask &= base_df['广告主平台配置名称'].isin(configs)
+    if media:
+        mask &= base_df['媒体平台名称'].isin(media)
+    if ids:
+        mask &= base_df['调度中心ID'].isin(ids)
+
+    return base_df[mask]
+
+
+# ==========================================
 # 💾 本地硬盘级持久化与长效 Cookie 隔离逻辑
 # ==========================================
 BASE_CACHE_DIR = ".streamlit_file_cache"
@@ -346,10 +372,18 @@ if st.session_state["cleaned_data"] is not None:
             st.info("⏳ 请在左侧边栏选择完整的【开始日期】和【结束日期】...")
             st.stop()
 
-        f_df_global = df[(df['日期'] >= selected_date_range[0]) & (df['日期'] <= selected_date_range[1])]
-        for col, selected in [("派系", t_factions), ("产品", t_products), ("广告主平台名称", t_platforms),
-                              ("广告主平台配置名称", t_configs), ("媒体平台名称", t_media), ("调度中心ID", t_ids)]:
-            if selected: f_df_global = f_df_global[f_df_global[col].isin(selected)]
+        # 调用高效缓存的向量化过滤引擎
+        f_df_global = get_filtered_dataframe(
+            df,
+            selected_date_range[0],
+            selected_date_range[1],
+            tuple(t_factions),
+            tuple(t_products),
+            tuple(t_platforms),
+            tuple(t_configs),
+            tuple(t_media),
+            tuple(t_ids)
+        )
 
 
         def process_view(dims, src_df):
@@ -420,7 +454,8 @@ if st.session_state["cleaned_data"] is not None:
                     if p_col in final.columns:
                         w_col = f"{col}环比"
                         final[w_col] = np.where((final["日期"] != "✨ 汇总") & (final[p_col] != 0),
-                                                ((final[col] - final[p_col]) / final[p_col]) * 100, 0.0)
+                                                ((final[col] - final[p_col]) / final[p_col].abs()) * 100, 0.0)
+                        final[w_col] = final[w_col].replace([np.inf, -np.inf], 0).fillna(0)
                         wow_col_names.append(w_col)
 
             for c in s_metrics:
@@ -460,8 +495,8 @@ if st.session_state["cleaned_data"] is not None:
             st.warning("⚠️ 当前筛选组合下无数据，请检查侧边栏多选框是否勾选。")
 
 
-        # --- 前端样式与数据表格渲染引擎 ---
-        def style_and_display(res_df, base_dims, wow_cols):
+        # --- 独立且安全的渲染与导出引擎函数 ---
+        def style_and_display(res_df, base_dims, wow_cols, table_key="default"):
             if res_df.empty: return st.info("所选筛选条件下无数据")
             table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + wow_cols
             disp_cols = [d for d in base_dims if d in res_df.columns] + [c for c in s_metrics if
@@ -513,43 +548,68 @@ if st.session_state["cleaned_data"] is not None:
                 column_config=c_config,
                 height=dynamic_height
             )
+
+            # CSV 一键导出
+            csv_data = res_df[disp_cols].to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label=f"📥 导出此分析数据",
+                data=csv_data,
+                file_name=f"OCPX_导出_{table_key}.csv",
+                mime="text/csv",
+                key=f"download_{table_key}"
+            )
             st.divider()
 
 
-        # ==================== 🚀 页面层级多维下钻对齐渲染 ====================
-        st.subheader("1️⃣ 配置号明细")
-        style_and_display(res1.head(700) if not res1.empty else res1,
-                          ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
-                          w1)
+        # ==================== 🚀 页面层级多维下钻对齐渲染 (Tabs 排版优化) ====================
+        tab1, tab2, tab3 = st.tabs(["1️⃣ 配置号明细", "2️⃣ 媒体平台明细", "3️⃣ 调度ID明细"])
 
-        st.subheader("2️⃣ 媒体平台明细")
-        if "媒体平台名称" in f_df_global.columns and not f_df_global.empty:
-            media_list_sorted = \
-                f_df_global.groupby("媒体平台名称")["广告主激活量"].sum().reset_index().sort_values(by="广告主激活量",
-                                                                                                    ascending=False)[
-                    "媒体平台名称"].tolist()
-            st.markdown(
-                f"💡 当前筛选组合内共覆盖 **{len(media_list_sorted)}** 个媒体：`{' / '.join(media_list_sorted) if media_list_sorted else '无'}`")
-        else:
-            st.markdown("💡 共有媒体：0 个")
+        with tab1:
+            st.subheader("配置号分析")
+            style_and_display(
+                res1.head(700) if not res1.empty else res1,
+                ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
+                w1,
+                table_key="配置号明细"
+            )
 
-        res2, w2 = process_view(["产品", "广告主平台配置名称", "媒体平台名称"], f_df_global)
-        style_and_display(res2, ["产品", "广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []), w2)
+        with tab2:
+            st.subheader("媒体平台分析")
+            if "媒体平台名称" in f_df_global.columns and not f_df_global.empty:
+                media_list_sorted = f_df_global.groupby("媒体平台名称")["广告主激活量"].sum().reset_index().sort_values(
+                    by="广告主激活量", ascending=False)["媒体平台名称"].tolist()
+                st.markdown(
+                    f"💡 当前筛选组合内共覆盖 **{len(media_list_sorted)}** 个媒体：`{' / '.join(media_list_sorted) if media_list_sorted else '无'}`")
+            else:
+                st.markdown("💡 共有媒体：0 个")
 
-        st.subheader("3️⃣ 调度ID明细")
-        if "媒体平台名称" in f_df_global.columns and "调度中心ID" in f_df_global.columns and not f_df_global.empty:
-            media_id_count = f_df_global.groupby("媒体平台名称")["调度中心ID"].nunique().reset_index()
-            media_id_count["激活量"] = media_id_count["媒体平台名称"].map(
-                f_df_global.groupby("媒体平台名称")["广告主激活量"].sum())
-            id_detail = " ｜ ".join([f"**{row['媒体平台名称']}** ({row['调度中心ID']}个)" for _, row in
-                                    media_id_count.sort_values("激活量", ascending=False).iterrows()])
-        else:
-            id_detail = "无数据"
-        st.markdown(f"🆔 各渠道下调度id分布：{id_detail}")
+            res2, w2 = process_view(["产品", "广告主平台配置名称", "媒体平台名称"], f_df_global)
+            style_and_display(
+                res2,
+                ["产品", "广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []),
+                w2,
+                table_key="媒体平台明细"
+            )
 
-        res3, w3 = process_view(["广告主平台配置名称", "媒体平台名称", "调度中心ID"], f_df_global)
-        style_and_display(res3, ["广告主平台配置名称", "媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []),
-                          w3)
+        with tab3:
+            st.subheader("调度ID分析")
+            if "媒体平台名称" in f_df_global.columns and "调度中心ID" in f_df_global.columns and not f_df_global.empty:
+                media_id_count = f_df_global.groupby("媒体平台名称")["调度中心ID"].nunique().reset_index()
+                media_id_count["激活量"] = media_id_count["媒体平台名称"].map(
+                    f_df_global.groupby("媒体平台名称")["广告主激活量"].sum())
+                id_detail = " ｜ ".join([f"**{row['媒体平台名称']}** ({row['调度中心ID']}个)" for _, row in
+                                        media_id_count.sort_values("激活量", ascending=False).iterrows()])
+            else:
+                id_detail = "无数据"
+            st.markdown(f"🆔 各渠道下调度id分布：{id_detail}")
+
+            res3, w3 = process_view(["广告主平台配置名称", "媒体平台名称", "调度中心ID"], f_df_global)
+            style_and_display(
+                res3,
+                ["广告主平台配置名称", "媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []),
+                w3,
+                table_key="调度ID明细"
+            )
 
     except Exception as e:
         st.error(f"处理出现技术错误: {e}")
