@@ -5,6 +5,8 @@ import json
 import os
 import re  # 💡 正则模块用于清洗数字尾缀
 import altair as alt  # ✨ 用于绘制高交互性大盘图表
+import uuid  # ✨ 新增：用于生成用户专属的隔离会话标识
+import extra_streamlit_components as stx  # ✨ 新增：用于实现浏览器 Cookie 长期持久化凭证
 
 
 # ==========================================
@@ -66,22 +68,18 @@ SPECIAL_MAPPING = {
 def extract_faction_and_product(config_name):
     config_str = str(config_name).strip()
 
-    # 当配置号包含优酷相关词汇时，直接剔除优酷相关的干扰字眼，优先检索别的字段
     cleaned_str = config_str
     if "优酷" in config_str:
         cleaned_str = re.sub(r'^(优酷媒体-|优酷-)', '', config_str).strip()
 
-    # 1. 优先使用清洗后的（或原有的）配置字符串进行大厂特例检索
     for product_name, info in SPECIAL_MAPPING.items():
         if any(keyword in cleaned_str for keyword in info["特征"]):
             return info["派系"], product_name
 
-    # 2. 优先进行 JSON 规则库（长词优先）匹配
     for rule in MATCH_RULE_LIST:
         if rule["product"] in cleaned_str:
             return rule["faction"], rule["product"]
 
-    # 3. 如果包含优酷且以上均未匹配成功，说明是未注册在规则库的冷门产品
     if "优酷" in config_str:
         pure_product = re.sub(r'[0-9_\-]+', '', cleaned_str).strip()
         if pure_product and pure_product != "优酷" and pure_product != "优酷媒体":
@@ -96,10 +94,16 @@ st.markdown("<p style='text-align: center; color: #666;'>欢迎提出使用建�
 st.divider()
 
 PRESET_RATES = {
-    "下单率": ("下单量", "广告主激活量"), "次留率": ("次日回访量", "广告主激活量"),
-    "激活率": ("广告主激活量", "上报广告主次数"), "唤醒率": ("唤醒量", "上报广告主次数"),
-    "首唤率": ("首唤量", "上报广告主次数"), "新登率": ("新登量", "广告主激活量"),
-    "首购率": ("首购量", "新登量"), "付费率": ("付费人数", "广告主激活量")
+    "下单率": ("下单量", "广告主激活量"),
+    "次留率": ("次日回访量", "广告主激活量"),
+    "三留率": ("3日留存次数", "广告主激活量"),
+    "七留率": ("7日留存次数", "广告主激活量"),
+    "激活率": ("广告主激活量", "上报广告主次数"),
+    "唤醒率": ("唤醒量", "上报广告主次数"),
+    "首唤率": ("首唤量", "上报广告主次数"),
+    "新登率": ("新登量", "广告主激活量"),
+    "首购率": ("首购量", "新登量"),
+    "付费率": ("付费人数", "广告主激活量")
 }
 
 
@@ -177,14 +181,31 @@ def load_and_clean_data_cached(file_contents, file_name):
 
 
 # ==========================================
-# 💾 本地硬盘级文件数据持久化逻辑
+# 💾 本地硬盘级持久化与长效 Cookie 隔离逻辑
 # ==========================================
-CACHE_DIR = ".streamlit_file_cache"
-CACHE_FILE = os.path.join(CACHE_DIR, "last_processed_data.feather")
-META_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
+BASE_CACHE_DIR = ".streamlit_file_cache"
+if not os.path.exists(BASE_CACHE_DIR):
+    os.makedirs(BASE_CACHE_DIR)
 
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+# 初始化 Cookie 管理器以实现长时间离开后凭证不丢失
+cookie_manager = stx.CookieManager()
+if cookie_manager.get_all() is None:
+    st.stop()
+
+# 尝试从浏览器 Cookie 中获取长效用户唯一凭证
+user_uuid = cookie_manager.get("persistent_user_uuid")
+if not user_uuid:
+    user_uuid = str(uuid.uuid4())
+    # 设置长效 Cookie（有效期 1 年）
+    cookie_manager.set("persistent_user_uuid", user_uuid, max_age=365 * 24 * 60 * 60)
+
+# 绑定专属的用户隔离硬盘目录
+USER_CACHE_DIR = os.path.join(BASE_CACHE_DIR, user_uuid)
+if not os.path.exists(USER_CACHE_DIR):
+    os.makedirs(USER_CACHE_DIR)
+
+CACHE_FILE = os.path.join(USER_CACHE_DIR, "last_processed_data.feather")
+META_FILE = os.path.join(USER_CACHE_DIR, "cache_metadata.json")
 
 
 def save_to_local_cache(df, file_name):
@@ -243,7 +264,7 @@ if uploaded_file:
 if st.session_state["cleaned_data"] is not None:
     try:
         df = st.session_state["cleaned_data"]
-        st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}` (已自动启用硬盘级持久化防掉线缓存)")
+        st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}` (已启用长效 Cookie 隔离与断线自动恢复缓存)")
 
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
 
@@ -334,7 +355,7 @@ if st.session_state["cleaned_data"] is not None:
         def process_view(dims, src_df):
             if src_df.empty: return pd.DataFrame(), []
 
-            base_needed = set(list(s_metrics) + ["次日回访量", "前日激活"])
+            base_needed = set(list(s_metrics) + ["次日回访量", "3日留存次数", "7日留存次数", "前日激活"])
             for r_name in PRESET_RATES: base_needed.update(PRESET_RATES[r_name])
             if show_cvr: base_needed.update([c_num, c_den])
 
@@ -348,7 +369,11 @@ if st.session_state["cleaned_data"] is not None:
 
             if show_daily:
                 daily = src_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
+                # 错位对齐各阶留存分子（按时间倒序或正序，利用 shift 将未来的回访数据平移对齐到激活日）
                 daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
+                daily["_tmp_3d_stay"] = daily.groupby(dims)["3日留存次数"].shift(-3).fillna(0)
+                daily["_tmp_7d_stay"] = daily.groupby(dims)["7日留存次数"].shift(-7).fillna(0)
+
                 if enable_wow and wow_targets:
                     for col in wow_targets: daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
 
@@ -374,8 +399,15 @@ if st.session_state["cleaned_data"] is not None:
                 if n in final.columns and d in final.columns:
                     num = pd.to_numeric(final[n], errors='coerce').fillna(0)
                     den = pd.to_numeric(final[d], errors='coerce').fillna(0)
+
+                    # 动态替换错位留存的分子
                     if name == "次留率" and "_tmp_next_stay" in final.columns:
                         num = np.where(final["日期"] != "✨ 汇总", final["_tmp_next_stay"], num)
+                    elif name == "三留率" and "_tmp_3d_stay" in final.columns:
+                        num = np.where(final["日期"] != "✨ 汇总", final["_tmp_3d_stay"], num)
+                    elif name == "七留率" and "_tmp_7d_stay" in final.columns:
+                        num = np.where(final["日期"] != "✨ 汇总", final["_tmp_7d_stay"], num)
+
                     final[name] = np.where(den > 0, (num / den) * 100, 0.0)
 
             if show_cvr and c_num in final.columns and c_den in final.columns:
@@ -427,11 +459,6 @@ if st.session_state["cleaned_data"] is not None:
         else:
             st.warning("⚠️ 当前筛选组合下无数据，请检查侧边栏多选框是否勾选。")
 
-        # ==========================================
-        # 📊 大盘核心可视化模块 (多选趋势指标升级版)
-        # ==========================================
-        
-
 
         # --- 前端样式与数据表格渲染引擎 ---
         def style_and_display(res_df, base_dims, wow_cols):
@@ -477,7 +504,6 @@ if st.session_state["cleaned_data"] is not None:
             for col in [c for c in s_metrics if c in res_df.columns]: c_config[col] = st.column_config.NumberColumn(
                 format="%d")
 
-            # 🔥 核心自适应高度设置：每行估算 35px，加上表头，最高 700px
             dynamic_height = min(35 * len(res_df) + 40, 700)
 
             st.dataframe(
