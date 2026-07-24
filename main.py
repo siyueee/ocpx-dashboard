@@ -161,8 +161,8 @@ st.divider()
 PRESET_RATES = {
     "下单率": ("下单量", "广告主激活量"),
     "次留率": ("次日回访量", "广告主激活量"),
-    "三留率": ("3日留存次数", "广告主激活量"),
-    "七留率": ("7日留存次数", "广告主激活量"),
+    "三留率": ("3日留存人数", "广告主激活量"),
+    "七留率": ("7日留存人数", "广告主激活量"),
     "激活率": ("广告主激活量", "上报广告主次数"),
     "唤醒率": ("唤醒量", "上报广告主次数"),
     "首唤率": ("首唤量", "上报广告主次数"),
@@ -521,7 +521,7 @@ if st.session_state["cleaned_data"] is not None:
             if src_df.empty: return pd.DataFrame(), []
 
             base_needed = set(
-                list(s_metrics) + ["次日回访量", "3日留存次数", "7日留存次数", "前日激活", "结算金额", "广告主激活量"])
+                list(s_metrics) + ["次日回访量", "3日留存人数", "7日留存人数", "前日激活", "结算金额", "广告主激活量"])
             for r_name in PRESET_RATES: base_needed.update(PRESET_RATES[r_name])
             if show_cvr: base_needed.update([c_num, c_den])
 
@@ -554,8 +554,8 @@ if st.session_state["cleaned_data"] is not None:
                 daily = src_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
 
                 daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
-                daily["_tmp_3d_stay"] = daily.groupby(dims)["3日留存次数"].shift(-3).fillna(0)
-                daily["_tmp_7d_stay"] = daily.groupby(dims)["7日留存次数"].shift(-7).fillna(0)
+                daily["_tmp_3d_stay"] = daily.groupby(dims)["3日留存人数"].shift(-3).fillna(0)
+                daily["_tmp_7d_stay"] = daily.groupby(dims)["7日留存人数"].shift(-7).fillna(0)
 
                 if enable_wow and wow_targets:
                     for col in wow_targets: daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
