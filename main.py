@@ -411,9 +411,9 @@ def process_view(
             final[name] = safe_ratio * 100
 
     if show_cvr and c_num in final.columns and c_den in final.columns:
-        cn = pd.to_numeric(final[c_num], errors='coerce').fillna(0)
-        cd = pd.to_numeric(final[c_den], errors='coerce').fillna(0)
-        cvr_res = np.divide(cn, cd, out=np.zeros_like(cn), where=cd > 0)
+        cn = pd.to_numeric(final[c_num], errors='coerce').fillna(0).astype(np.float64)
+        cd = pd.to_numeric(final[c_den], errors='coerce').fillna(0).astype(np.float64)
+        cvr_res = np.divide(cn, cd, out=np.zeros_like(cn, dtype=np.float64), where=cd > 0)
         final[cvr_name] = cvr_res * 100
 
     wow_col_names = []
@@ -422,17 +422,21 @@ def process_view(
             p_col = f"prev_{col}"
             if p_col in final.columns:
                 w_col = f"{col}环比"
-                curr = final[col]
-                prev = final[p_col]
+                curr = pd.to_numeric(final[col], errors='coerce').astype(np.float64)
+                prev = pd.to_numeric(final[p_col], errors='coerce').astype(np.float64)
                 diff = curr - prev
-                wow_res = np.divide(diff, prev.abs(), out=np.zeros_like(diff), where=prev.abs() > 1e-9)
+                wow_res = np.divide(diff, prev.abs(), out=np.zeros_like(diff, dtype=np.float64), where=prev.abs() > 1e-9)
                 final[w_col] = np.where(final["日期"] != "✨ 汇总", wow_res * 100, 0.0)
                 final[w_col] = final[w_col].replace([np.inf, -np.inf], 0).fillna(0)
                 wow_col_names.append(w_col)
 
+    int_skip = {"单价", "结算金额"}
     for c in s_metrics:
         if c in final.columns:
-            final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).astype(int)
+            if c in int_skip:
+                final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).round(4)
+            else:
+                final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).astype(int)
     return final, wow_col_names
 
 
@@ -538,7 +542,7 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     if "负责人" in disp_cols:
         c_config["负责人"] = st.column_config.TextColumn(width="small")
     for r_col in [r for r in table_rates if r in disp_df.columns]:
-        c_config[r_col] = st.column_config.NumberColumn(format="%.1f%%", width="small")
+        c_config[r_col] = st.column_config.NumberColumn(format="%.2f%%", width="small")
     for m_col in [c for c in s_metrics if c in disp_df.columns]:
         c_config[m_col] = st.column_config.NumberColumn(format="%d")
 
@@ -791,14 +795,33 @@ if st.session_state["cleaned_data"] is not None:
                 color = card_colors[idx % 4]
                 with kpi_cols[idx]:
                     if kpi_type == "number":
-                        total_val = int(f_df_global[name].sum())
+                        label = "总结算金额" if name == "结算金额" else f"周期总 {name}"
+                        if name in ("单价",):
+                            total_val = f"{f_df_global[name].mean():.4f}" if f_df_global[name].sum() > 0 else "0"
+                        elif name == "结算金额":
+                            total_val = f"{pd.to_numeric(f_df_global[name], errors='coerce').sum():,.2f}"
+                        else:
+                            total_val = f"{int(f_df_global[name].sum()):,}"
                         st.markdown(
-                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📊 周期总 {name}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{total_val:,}</h3></div>',
+                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📊 {label}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{total_val}</h3></div>',
                             unsafe_allow_html=True)
                     else:
-                        rate_val = res1[name].iloc[0] if not res1.empty and name in res1.columns else 0.0
+                        if name in PRESET_RATES:
+                            n_col, d_col = PRESET_RATES[name]
+                            if n_col in f_df_global.columns and d_col in f_df_global.columns:
+                                raw_n = pd.to_numeric(f_df_global[n_col], errors='coerce').sum()
+                                raw_d = pd.to_numeric(f_df_global[d_col], errors='coerce').sum()
+                                rate_val = (raw_n / raw_d * 100) if raw_d > 1e-9 else 0.0
+                            else:
+                                rate_val = 0.0
+                        elif show_cvr and name == cvr_name and c_num in f_df_global.columns and c_den in f_df_global.columns:
+                            raw_n = pd.to_numeric(f_df_global[c_num], errors='coerce').sum()
+                            raw_d = pd.to_numeric(f_df_global[c_den], errors='coerce').sum()
+                            rate_val = (raw_n / raw_d * 100) if raw_d > 1e-9 else 0.0
+                        else:
+                            rate_val = res1[name].iloc[0] if not res1.empty and name in res1.columns else 0.0
                         st.markdown(
-                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📈 大盘综合 {name}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{rate_val:.1f}%</h3></div>',
+                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📈 大盘综合 {name}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{rate_val:.2f}%</h3></div>',
                             unsafe_allow_html=True)
             st.write("")
 
