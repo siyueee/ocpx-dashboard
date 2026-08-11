@@ -8,7 +8,7 @@ import uuid
 import extra_streamlit_components as stx
 import requests
 
-# ====================== 全局常量【统一管理，消除魔法字符串】 ======================
+# ====================== 全局常量 ======================
 TARGET_MAP = {
     "激活": "广告主激活量",
     "唤醒": "唤醒量",
@@ -57,60 +57,87 @@ SPECIAL_MAPPING = {
 BASE_CACHE_DIR = ".streamlit_file_cache"
 
 # ====================== 工具函数 ======================
-def safe_div(numerator, denominator, fill=0.0):
-    """安全除法，避免除零报错"""
-    return np.divide(
-        numerator,
-        denominator,
-        out=np.full_like(numerator, fill, dtype=np.float64),
-        where=denominator != 0
-    )
 
-@st.cache_data(show_spinner=False)
+def _clean_name_like_raw(x):
+    """和底表 clean_name 完全一致的截断逻辑 — 飞书配置也用这个，确保两边 key 匹配"""
+    if pd.isna(x): return ""
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan": return ""
+    return s.split('_', 1)[-1] if '_' in s else s
+
+
+@st.cache_data(show_spinner=True, ttl=300)
 def load_feishu_price_config():
-    """读取飞书多维表格配置，返回广告主配置名称 → 单价、回传维度映射"""
+    """读取飞书多维表格配置，缓存5分钟自动刷新"""
     app_id = st.secrets["feishu"]["app_id"]
     app_secret = st.secrets["feishu"]["app_secret"]
     spreadsheet_token = st.secrets["feishu"]["spreadsheet_token"]
     sheet_id = st.secrets["feishu"]["sheet_id"]
 
-    token_res = requests.post(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": app_id, "app_secret": app_secret},
-        timeout=30
-    )
-    token_data = token_res.json()
-    if token_data.get("code") != 0:
-        return pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
-    access_token = token_data["tenant_access_token"]
-    headers = {"Authorization": f"Bearer {access_token}"}
+    empty_df = pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
 
-    range_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}"
-    data_res = requests.get(range_url, headers=headers, timeout=30)
-    data_json = data_res.json()
-    if data_json.get("code") != 0:
-        return pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
+    try:
+        token_res = requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": app_id, "app_secret": app_secret},
+            timeout=30
+        )
+        token_data = token_res.json()
+        if token_data.get("code") != 0:
+            st.error(f"飞书鉴权失败: {token_data.get('msg', '未知错误')}")
+            return empty_df
+        access_token = token_data["tenant_access_token"]
+        headers = {"Authorization": f"Bearer {access_token}"}
 
-    values = data_json["data"]["valueRange"]["values"]
-    if not values or len(values) < 2:
-        return pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
+        range_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}"
+        data_res = requests.get(range_url, headers=headers, timeout=30)
+        data_json = data_res.json()
+        if data_json.get("code") != 0:
+            st.error(f"飞书表格读取失败: {data_json.get('msg', '未知错误')}")
+            return empty_df
 
-    df_config = pd.DataFrame(values[1:], columns=values[0])
-    rename_map = {}
-    for col in df_config.columns:
-        if "广告主配置" in str(col):
-            rename_map[col] = "广告主配置"
-        elif "单价" in str(col):
-            rename_map[col] = "单价"
-        elif "回传维度" in str(col):
-            rename_map[col] = "回传维度"
-    df_config.rename(columns=rename_map, inplace=True)
+        values = data_json["data"]["valueRange"]["values"]
+        if not values or len(values) < 2:
+            st.warning("飞书表格无数据或只有表头")
+            return empty_df
 
-    df_config["单价"] = pd.to_numeric(df_config["单价"], errors="coerce").fillna(0)
-    return df_config
+        df_config = pd.DataFrame(values[1:], columns=values[0])
+        rename_map = {}
+        for col in df_config.columns:
+            col_str = str(col).strip()
+            if col_str == "None" or col_str == "":
+                continue
+            if col_str in ("配置号", "广告主配置", "配置名称") or ("广告主" in col_str and "配置" in col_str):
+                rename_map[col] = "广告主配置"
+            elif col_str in ("合作价格", "单价", "结算单价", "价格") or ("单价" in col_str) or ("价格" in col_str):
+                rename_map[col] = "单价"
+            elif col_str in ("回传维度", "维度") or ("回传" in col_str):
+                rename_map[col] = "回传维度"
+        df_config.rename(columns=rename_map, inplace=True)
+        df_config = df_config.loc[:, ~df_config.columns.isin([None, "None", ""])]
 
-@st.cache_data
-def load_product_config():
+        missing = [c for c in ["广告主配置", "单价", "回传维度"] if c not in df_config.columns]
+        if missing:
+            st.error(f"飞书表格缺少必要列: {missing}，实际列: {list(df_config.columns)}")
+            return empty_df
+
+        df_config["广告主配置"] = df_config["广告主配置"].apply(_clean_name_like_raw)
+        df_config["单价"] = pd.to_numeric(df_config["单价"], errors="coerce").fillna(0)
+        df_config["回传维度"] = df_config["回传维度"].astype(str).str.strip()
+        df_config = df_config[df_config["广告主配置"] != ""]
+        df_config = df_config.drop_duplicates(subset=["广告主配置"], keep="first")
+        return df_config.reset_index(drop=True)
+    except requests.RequestException as e:
+        st.error(f"飞书网络请求失败: {e}")
+        return empty_df
+    except Exception as e:
+        st.error(f"飞书配置加载异常: {e}")
+        return empty_df
+
+
+@st.cache_data(show_spinner=False)
+def _get_product_config():
+    """懒加载：只在第一次使用时读文件"""
     config_path = "products_config.json"
     config = {"factions": {}}
     if os.path.exists(config_path):
@@ -126,9 +153,8 @@ def load_product_config():
     sorted_match_list = sorted(all_products_flat, key=lambda x: len(x["product"]), reverse=True)
     return sorted_match_list, config.get("default_faction", "其他派系"), config.get("default_product", "其他产品")
 
-MATCH_RULE_LIST, DEFAULT_FACTION, DEFAULT_PRODUCT = load_product_config()
 
-def extract_faction_and_product(config_name):
+def extract_faction_and_product(config_name, match_rules, default_faction, default_product):
     """根据广告配置名称自动识别派系、产品名称"""
     config_str = str(config_name).strip()
     cleaned_str = config_str
@@ -139,7 +165,7 @@ def extract_faction_and_product(config_name):
         if any(keyword in cleaned_str for keyword in info["特征"]):
             return info["派系"], product_name
 
-    for rule in MATCH_RULE_LIST:
+    for rule in match_rules:
         if rule["product"] in cleaned_str:
             return rule["faction"], rule["product"]
 
@@ -148,12 +174,15 @@ def extract_faction_and_product(config_name):
         if pure_product and pure_product != "优酷" and pure_product != "优酷媒体":
             return "其他派系", pure_product
 
-    return DEFAULT_FACTION, DEFAULT_PRODUCT
+    return default_faction, default_product
+
 
 @st.cache_data(show_spinner=False)
 def load_and_clean_data_cached(file_contents, file_name):
     """读取上传文件、统一清洗格式，生成标准化底表"""
     import io
+    match_rules, default_faction, default_product = _get_product_config()
+
     if file_name.endswith('.csv'):
         raw_df = None
         for enc in ['utf_8_sig', 'gbk', 'gb18030']:
@@ -185,14 +214,16 @@ def load_and_clean_data_cached(file_contents, file_name):
             raw_df[col] = "未分类"
 
     if '广告主平台配置名称' in raw_df.columns:
-        extracted = [extract_faction_and_product(val) for val in raw_df['广告主平台配置名称']]
+        extracted = [extract_faction_and_product(val, match_rules, default_faction, default_product)
+                     for val in raw_df['广告主平台配置名称']]
         raw_df['派系'] = [e[0] for e in extracted]
         raw_df['产品'] = [e[1] for e in extracted]
     else:
-        raw_df['派系'], raw_df['产品'] = DEFAULT_FACTION, DEFAULT_PRODUCT
+        raw_df['派系'], raw_df['产品'] = default_faction, default_product
 
-    raw_df['调度中心ID'] = raw_df['调度中心ID'].astype(str).str.replace('.0', '', regex=False).str.strip().fillna(
-        "未关联ID") if '调度中心ID' in raw_df.columns else "未关联ID"
+    raw_df['调度中心ID'] = (raw_df['调度中心ID']
+                            .astype(str).str.replace('.0', '', regex=False).str.strip().fillna("未关联ID")
+                            if '调度中心ID' in raw_df.columns else "未关联ID")
 
     raw_df['日期'] = pd.to_datetime(raw_df['日期'], errors='coerce').dt.date
     if '小时' in raw_df.columns:
@@ -229,9 +260,12 @@ def load_and_clean_data_cached(file_contents, file_name):
         raw_df["负责人"] = ""
     return raw_df
 
+
 @st.cache_data(show_spinner=False)
-def get_filtered_dataframe(base_df, start_date, end_date, factions, products, platforms, configs, media, ids, owners):
-    """根据侧边栏筛选条件过滤基础数据"""
+def get_filtered_dataframe(base_df, start_date, end_date,
+                           factions: tuple, products: tuple, platforms: tuple,
+                           configs: tuple, media: tuple, ids: tuple, owners: tuple):
+    """根据侧边栏筛选条件过滤基础数据 — 全参数化，可缓存"""
     mask = (base_df['日期'] >= start_date) & (base_df['日期'] <= end_date)
     if factions: mask &= base_df['派系'].isin(factions)
     if products: mask &= base_df['产品'].isin(products)
@@ -242,29 +276,52 @@ def get_filtered_dataframe(base_df, start_date, end_date, factions, products, pl
     if owners: mask &= base_df['负责人'].isin(owners)
     return base_df[mask]
 
-def save_to_local_cache(df, file_name):
-    """清洗后数据写入本地feather缓存，断线自动恢复"""
-    try:
-        df.to_feather(CACHE_FILE, compression="zstd")
-        with open(META_FILE, "w", encoding="utf-8") as f:
-            json.dump({"file_name": file_name}, f)
-    except Exception as e:
-        st.warning(f"本地硬盘缓存写入失败: {e}")
 
-def load_from_local_cache():
-    """读取本地缓存文件"""
-    if os.path.exists(CACHE_FILE) and os.path.exists(META_FILE):
-        try:
-            with open(META_FILE, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            df = pd.read_feather(CACHE_FILE)
-            return df, meta.get("file_name")
-        except Exception:
-            return None, None
-    return None, None
+@st.cache_data(show_spinner=False)
+def merge_price_and_calc_settle(df_raw, df_price_config):
+    """单价合并 + 结算金额计算 — 独立缓存，单价配置不变时秒返回"""
+    work_df = df_raw.copy()
+    if "单价" not in work_df.columns:
+        work_df["单价"] = 0.0
+    if "回传维度" not in work_df.columns:
+        work_df["回传维度"] = "未配置"
 
-def process_view(dims, src_df):
-    """数据聚合核心函数"""
+    pc = df_price_config.copy()
+    pc["广告主配置"] = pc["广告主配置"].astype(str).str.strip()
+    price_map = dict(pc[["广告主配置", "单价"]].values)
+    dimension_map = dict(pc[["广告主配置", "回传维度"]].values)
+
+    cleaned = work_df["广告主平台配置名称"].astype(str).str.strip()
+    work_df["单价"] = cleaned.map(price_map).fillna(work_df["单价"])
+    work_df["回传维度"] = cleaned.map(dimension_map).fillna(work_df["回传维度"])
+    work_df["单价"] = pd.to_numeric(work_df["单价"], errors='coerce').fillna(0)
+    work_df["回传维度"] = work_df["回传维度"].astype(str).fillna("未配置")
+
+    work_df["结算金额"] = 0.0
+    for dim_name, target_col in TARGET_MAP.items():
+        if target_col not in work_df.columns:
+            continue
+        match_mask = work_df["回传维度"] == dim_name
+        work_df.loc[match_mask, "结算金额"] = (work_df.loc[match_mask, target_col]
+                                               * work_df.loc[match_mask, "单价"])
+    work_df["结算金额"] = pd.to_numeric(work_df["结算金额"], errors='coerce').fillna(0)
+    return work_df
+
+
+@st.cache_data(show_spinner=False)
+def process_view(
+    dims: tuple,
+    src_df: pd.DataFrame,
+    show_daily: bool,
+    show_cvr: bool,
+    c_num: str,
+    c_den: str,
+    cvr_name: str,
+    enable_wow: bool,
+    wow_targets: tuple,
+    s_metrics: tuple,
+):
+    """数据聚合核心函数 — 所有配置显式参数化，完整可缓存"""
     if src_df.empty:
         return pd.DataFrame(), []
 
@@ -279,13 +336,13 @@ def process_view(dims, src_df):
     for c in base_needed:
         if c in src_df.columns:
             if c == "单价":
-                agg_map[c] = lambda x: x.iloc[0] if not x.empty else 0
+                agg_map[c] = lambda x: x.iloc[0] if len(x) > 0 else 0
             else:
                 agg_map[c] = 'sum'
     if "负责人" in src_df.columns and "负责人" not in agg_map:
-        agg_map["负责人"] = lambda s: s.iloc[0] if len(s) > 0 else ""
+        agg_map["负责人"] = lambda x: x.iloc[0] if len(x) > 0 else ""
 
-    summary = src_df.groupby(dims).agg(agg_map).reset_index()
+    summary = src_df.groupby(list(dims)).agg(agg_map).reset_index()
     metric_cols = [col for col in base_needed if col in summary.columns]
     for col in metric_cols:
         summary[col] = pd.to_numeric(summary[col], errors='coerce').fillna(0)
@@ -296,22 +353,22 @@ def process_view(dims, src_df):
     summary["日期"] = "✨ 汇总"
 
     if show_daily:
-        daily = src_df.groupby(dims + ["日期"]).agg(agg_map).reset_index()
+        daily = src_df.groupby(list(dims) + ["日期"]).agg(agg_map).reset_index()
         for col in metric_cols:
             if col in daily.columns:
                 daily[col] = pd.to_numeric(daily[col], errors='coerce').fillna(0)
 
-        daily["_tmp_next_stay"] = daily.groupby(dims)["次日回访量"].shift(-1).fillna(0)
-        daily["_tmp_3d_stay"] = daily.groupby(dims)["3日留存次数"].shift(-3).fillna(0)
-        daily["_tmp_7d_stay"] = daily.groupby(dims)["7日留存次数"].shift(-7).fillna(0)
+        daily["_tmp_next_stay"] = daily.groupby(list(dims))["次日回访量"].shift(-1).fillna(0)
+        daily["_tmp_3d_stay"] = daily.groupby(list(dims))["3日留存次数"].shift(-3).fillna(0)
+        daily["_tmp_7d_stay"] = daily.groupby(list(dims))["7日留存次数"].shift(-7).fillna(0)
 
         if enable_wow and wow_targets:
             for col in wow_targets:
-                daily[f"prev_{col}"] = daily.groupby(dims)[col].shift(1)
+                daily[f"prev_{col}"] = daily.groupby(list(dims))[col].shift(1)
 
         summary_ordered = summary.copy()
         summary_ordered['_order'] = range(len(summary_ordered))
-        daily_ordered = daily.merge(summary_ordered[dims + ['_order']], on=dims, how='inner')
+        daily_ordered = daily.merge(summary_ordered[list(dims) + ['_order']], on=list(dims), how='inner')
 
         summary_ordered['日期'] = "✨ 汇总"
         final = pd.concat([summary_ordered, daily_ordered], ignore_index=True)
@@ -329,7 +386,6 @@ def process_view(dims, src_df):
             total_row["负责人"] = ""
         final = pd.concat([total_row, final], ignore_index=True)
 
-    # 计算预置比率
     for name, (n, d) in PRESET_RATES.items():
         if n in final.columns and d in final.columns:
             raw_num = pd.to_numeric(final[n], errors='coerce').fillna(0)
@@ -338,21 +394,22 @@ def process_view(dims, src_df):
 
             mask_daily = final["日期"] != "✨ 汇总" if "日期" in final.columns else pd.Series(False, index=final.index)
             if name == "次留率" and "_tmp_next_stay" in final.columns:
-                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_next_stay"], errors='coerce').fillna(0)
+                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_next_stay"],
+                                                         errors='coerce').fillna(0)
             elif name == "三留率" and "_tmp_3d_stay" in final.columns:
-                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_3d_stay"], errors='coerce').fillna(0)
+                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_3d_stay"],
+                                                         errors='coerce').fillna(0)
             elif name == "七留率" and "_tmp_7d_stay" in final.columns:
-                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_7d_stay"], errors='coerce').fillna(0)
+                calc_num.loc[mask_daily] = pd.to_numeric(final.loc[mask_daily, "_tmp_7d_stay"],
+                                                         errors='coerce').fillna(0)
 
             safe_ratio = np.divide(
-                calc_num.values,
-                raw_den.values,
+                calc_num.values, raw_den.values,
                 out=np.zeros_like(calc_num.values, dtype=np.float64),
                 where=raw_den.values > 1e-9
             )
             final[name] = safe_ratio * 100
 
-    # 自定义CVR
     if show_cvr and c_num in final.columns and c_den in final.columns:
         cn = pd.to_numeric(final[c_num], errors='coerce').fillna(0)
         cd = pd.to_numeric(final[c_den], errors='coerce').fillna(0)
@@ -373,46 +430,45 @@ def process_view(dims, src_df):
                 final[w_col] = final[w_col].replace([np.inf, -np.inf], 0).fillna(0)
                 wow_col_names.append(w_col)
 
-    # 指标强制转为整数
     for c in s_metrics:
         if c in final.columns:
             final[c] = pd.to_numeric(final[c], errors='coerce').fillna(0).astype(int)
     return final, wow_col_names
 
-# ======================【统一表格渲染函数】合并原来两套重复渲染逻辑 ======================
-def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_owner=False):
-    """
-    统一表格渲染、样式、导出
-    :param insert_owner: 是否在调度中心ID后插入负责人列（Tab3专属开关）
-    """
-    if res_df.empty:
-        return st.info("所选筛选条件下无数据")
 
-    table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + wow_cols
+# ====================== 表格渲染 ======================
+
+def _build_disp_df(res_df, base_dims, wow_cols, table_rates, s_metrics, insert_owner):
+    """纯函数：根据配置生成展示列 DataFrame"""
     base_cols = [d for d in base_dims if d in res_df.columns]
-    target_metrics = [c for c in s_metrics if c in res_df.columns and c not in ["单价", "结算金额"]]
-    special_cols = [c for c in ["单价", "结算金额"] if c in res_df.columns]
+    target_metrics = [c for c in s_metrics if c in res_df.columns and c not in ("单价", "结算金额")]
+    special_cols = [c for c in ("单价", "结算金额") if c in res_df.columns]
 
     disp_cols = base_cols.copy()
-    # Tab3：调度ID后插入负责人
     if insert_owner and "调度中心ID" in disp_cols and "负责人" in res_df.columns:
         insert_pos = disp_cols.index("调度中心ID") + 1
         disp_cols.insert(insert_pos, "负责人")
 
     disp_cols = disp_cols + special_cols + target_metrics + [r for r in table_rates if r in res_df.columns]
-    disp_df = res_df[disp_cols].copy()
+    return res_df[disp_cols].copy(), disp_cols
 
-    # 初始化样式矩阵
+
+@st.cache_data(show_spinner=False)
+def _compute_style_matrix(
+    disp_df,
+    disp_cols,
+    wow_cols: tuple,
+    enable_alert: bool,
+    alert_rules: tuple,
+):
+    """纯计算：生成样式矩阵 — 样式配置不变时命中缓存"""
     style_matrix = pd.DataFrame("", index=disp_df.index, columns=disp_df.columns)
 
-    # 汇总行底色
     mask_total_summary = pd.Series(False, index=disp_df.index)
     if "广告主平台配置名称" in disp_df.columns:
-        mask1 = disp_df["广告主平台配置名称"].str.contains("【全配置号汇总】", na=False)
-        mask_total_summary |= mask1
+        mask_total_summary |= disp_df["广告主平台配置名称"].str.contains("【全配置号汇总】", na=False)
     if "派系" in disp_df.columns:
-        mask2 = disp_df["派系"].str.contains("【全大盘派系汇总】", na=False)
-        mask_total_summary |= mask2
+        mask_total_summary |= disp_df["派系"].str.contains("【全大盘派系汇总】", na=False)
 
     mask_group_summary = pd.Series(False, index=disp_df.index)
     if "日期" in disp_df.columns:
@@ -421,8 +477,7 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     style_matrix.loc[mask_total_summary, :] = "background-color: #FFF2CC; font-weight: bold; color: #D68910;"
     style_matrix.loc[mask_group_summary, :] = "background-color: #E6F3FF; font-weight: bold; color: #1f77b4;"
 
-    # 爆红预警
-    if enable_alert:
+    if enable_alert and alert_rules:
         for rule in alert_rules:
             target, logi, threshold = rule['target'], rule['logic'], rule['val']
             if target not in disp_cols:
@@ -436,7 +491,6 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
             elif logi == "==": cond = np.isclose(series, threshold, atol=1e-6)
             style_matrix.loc[cond, target] = "color: white; font-weight: bold; background-color: #FF4B4B;"
 
-    # 环比涨跌颜色
     for w_col in wow_cols:
         if w_col not in disp_cols:
             continue
@@ -446,15 +500,38 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
         style_matrix.loc[mask_up & (style_matrix[w_col] == ""), w_col] += "color: #d00000; font-weight: bold;"
         style_matrix.loc[mask_down & (style_matrix[w_col] == ""), w_col] += "color: #008000; font-weight: bold;"
 
+    return style_matrix.reset_index(drop=True)
+
+
+def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_owner=False,
+                     selected_rate_names=None, show_cvr=False, cvr_name=None,
+                     s_metrics=None, enable_alert=False, alert_rules=None):
+    """统一表格渲染 — 样式计算部分已拆分并可缓存"""
+    if res_df.empty:
+        return st.info("所选筛选条件下无数据")
+
+    selected_rate_names = selected_rate_names or []
+    s_metrics = s_metrics or []
+    alert_rules = alert_rules or []
+
+    table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + list(wow_cols)
+    disp_df, disp_cols = _build_disp_df(res_df, base_dims, list(wow_cols), table_rates, list(s_metrics), insert_owner)
+
+    style_matrix = _compute_style_matrix(
+        disp_df,
+        disp_cols,
+        tuple(wow_cols),
+        enable_alert,
+        tuple(alert_rules),
+    )
+
     disp_df = disp_df.reset_index(drop=True)
-    style_matrix = style_matrix.reset_index(drop=True)
 
     def row_styler(_row):
         return style_matrix.loc[_row.name].tolist()
 
     styler = disp_df.style.apply(row_styler, axis=1)
 
-    # 列配置
     c_config = {}
     if "日期" in disp_cols:
         c_config["日期"] = st.column_config.TextColumn(width="small")
@@ -474,7 +551,6 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
         height=dynamic_height
     )
 
-    # 导出csv
     csv_data = disp_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         label=f"📥 导出{table_key}",
@@ -485,7 +561,8 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     )
     st.divider()
 
-# ====================== 页面初始化、Cookie缓存逻辑（完全原样保留） ======================
+
+# ====================== 页面初始化 ======================
 st.set_page_config(page_title="OCPX业务数据全维度分析看板", layout="wide", initial_sidebar_state="expanded")
 st.markdown("<h2 style='text-align: center; color: #1F77B4;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; color: #666;'>欢迎提出使用建议~🍦</p>", unsafe_allow_html=True)
@@ -507,12 +584,32 @@ os.makedirs(USER_CACHE_DIR, exist_ok=True)
 CACHE_FILE = os.path.join(USER_CACHE_DIR, "last_processed_data.feather")
 META_FILE = os.path.join(USER_CACHE_DIR, "cache_metadata.json")
 
-# Session状态初始化
+
+def load_from_local_cache():
+    if os.path.exists(CACHE_FILE) and os.path.exists(META_FILE):
+        try:
+            with open(META_FILE, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            df = pd.read_feather(CACHE_FILE)
+            return df, meta.get("file_name")
+        except Exception:
+            return None, None
+    return None, None
+
+
+def save_to_local_cache(df, file_name):
+    try:
+        df.to_feather(CACHE_FILE, compression="zstd")
+        with open(META_FILE, "w", encoding="utf-8") as f:
+            json.dump({"file_name": file_name}, f)
+    except Exception as e:
+        st.warning(f"本地硬盘缓存写入失败: {e}")
+
+
 if "cleaned_data" not in st.session_state:
     cached_df, cached_name = load_from_local_cache()
     if cached_df is not None:
-        import copy
-        temp_df = cached_df.copy()
+        temp_df = cached_df
         for col_name in ["单价", "回传维度", "结算金额"]:
             if col_name not in temp_df.columns:
                 if col_name == "单价":
@@ -527,7 +624,7 @@ if "cleaned_data" not in st.session_state:
         st.session_state["cleaned_data"] = None
         st.session_state["file_name"] = None
 
-# 文件上传区域
+
 col_upload, col_clear = st.columns([4, 1])
 with col_upload:
     uploaded_file = st.file_uploader("📥 上传原始报表数据 (支持 .xlsx / .csv)", type=["csv", "xlsx"])
@@ -536,6 +633,7 @@ with col_clear:
     if st.button("🗑️ 清除缓存数据", use_container_width=True):
         if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
         if os.path.exists(META_FILE): os.remove(META_FILE)
+        st.cache_data.clear()
         st.session_state["cleaned_data"] = None
         st.session_state["file_name"] = None
         st.rerun()
@@ -553,44 +651,31 @@ if uploaded_file:
 
 if st.session_state["cleaned_data"] is not None:
     try:
-        import copy
-        df_raw = copy.deepcopy(st.session_state["cleaned_data"])
         st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}` (已启用长效 Cookie 隔离与断线自动恢复缓存)")
 
-        df_price_config = load_feishu_price_config()
-        df_raw["广告主平台配置名称"] = df_raw["广告主平台配置名称"].astype(str).str.strip()
-        df_price_config["广告主配置"] = df_price_config["广告主配置"].astype(str).str.strip()
+        with st.sidebar:
+            st.markdown("<h3 style='color: #1F77B4;'>💰 飞书配置</h3>", unsafe_allow_html=True)
+            df_price_config = load_feishu_price_config()
+            st.caption(f"飞书单价配置已加载 {len(df_price_config)} 条（5分钟自动刷新）")
+            if not df_price_config.empty:
+                with st.expander("🔍 飞书配置预览（前5条）"):
+                    st.dataframe(df_price_config.head(), use_container_width=True, hide_index=True)
+            if st.button("🔄 立即刷新飞书配置", key="refresh_feishu"):
+                load_feishu_price_config.clear()
+                st.success("已清除缓存，重新拉取中...")
+                st.rerun()
 
-        df_merged = df_raw.copy()
-        if "单价" not in df_merged.columns:
-            df_merged["单价"] = 0.0
-        if "回传维度" not in df_merged.columns:
-            df_merged["回传维度"] = "未配置"
+            st.divider()
 
-        price_map = dict(df_price_config[["广告主配置", "单价"]].values)
-        dimension_map = dict(df_price_config[["广告主配置", "回传维度"]].values)
-        map_price_series = df_merged["广告主平台配置名称"].map(price_map)
-        map_dim_series = df_merged["广告主平台配置名称"].map(dimension_map)
-
-        df_merged["单价"] = map_price_series.fillna(df_merged["单价"])
-        df_merged["回传维度"] = map_dim_series.fillna(df_merged["回传维度"])
-        df_merged["单价"] = pd.to_numeric(df_merged["单价"], errors='coerce').fillna(0)
-        df_merged["回传维度"] = df_merged["回传维度"].astype(str).fillna("未配置")
-
-        # 结算金额计算
-        # ========= 删除原来的 calc_settle_amount + df_merged["结算金额"] = df_merged.apply(...) =========
-        # 替换为下面矢量化逻辑
-        df_merged["结算金额"] = 0.0
-        for dim_name, target_col in TARGET_MAP.items():
-            if target_col not in df_merged.columns:
-                continue
-            match_mask = df_merged["回传维度"] == dim_name
-            df_merged.loc[match_mask, "结算金额"] = df_merged.loc[match_mask, target_col] * df_merged.loc[
-                match_mask, "单价"]
-        df_merged["结算金额"] = pd.to_numeric(df_merged["结算金额"], errors="coerce").fillna(0)
-        st.session_state["cleaned_data"] = df_merged
-        df = df_merged
+        df_raw = st.session_state["cleaned_data"]
+        df = merge_price_and_calc_settle(df_raw, df_price_config)
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+
+        if not df_price_config.empty and "单价" in df.columns:
+            matched_count = int((df["单价"] > 0).sum())
+            total_count = len(df)
+            match_rate = matched_count / total_count * 100 if total_count > 0 else 0
+            st.caption(f"🔗 单价匹配: {matched_count}/{total_count} 行有单价 ({match_rate:.1f}%)")
 
         # ====================== 侧边栏控件 ======================
         with st.sidebar:
@@ -647,7 +732,8 @@ if st.session_state["cleaned_data"] is not None:
                 cvr_name = f"CVR({c_num}/{c_den})"
 
             enable_wow = st.toggle("开启指标环比 (对比前一日)", value=False)
-            wow_targets = st.multiselect("选择看环比的数值列", numeric_cols, default=[f for f in ["广告主激活量"] if f in numeric_cols]) if enable_wow else []
+            wow_targets_list = st.multiselect("选择看环比的数值列", numeric_cols,
+                                              default=[f for f in ["广告主激活量"] if f in numeric_cols]) if enable_wow else []
 
             enable_alert = st.toggle("开启爆红预警高亮", value=False)
             alert_rules = []
@@ -675,25 +761,28 @@ if st.session_state["cleaned_data"] is not None:
             df,
             selected_date_range[0],
             selected_date_range[1],
-            tuple(t_factions),
-            tuple(t_products),
-            tuple(t_platforms),
-            tuple(t_configs),
-            tuple(t_media),
-            tuple(t_ids),
-            tuple(t_owners)
+            tuple(t_factions), tuple(t_products), tuple(t_platforms),
+            tuple(t_configs), tuple(t_media), tuple(t_ids), tuple(t_owners)
         )
 
-        res1, w1 = process_view(["派系", "产品", "广告主平台名称", "广告主平台配置名称"], f_df_global)
+        res1, w1 = process_view(
+            ("派系", "产品", "广告主平台名称", "广告主平台配置名称"),
+            f_df_global,
+            show_daily, show_cvr, c_num, c_den, cvr_name,
+            enable_wow, tuple(wow_targets_list), tuple(s_metrics)
+        )
 
         # KPI顶部卡片
         if not f_df_global.empty:
-            active_kpi_pool = [{"name": m, "type": "number"} for m in s_metrics if m in f_df_global.columns] + \
-                              [{"name": r, "type": "rate"} for r in selected_rate_names if r in PRESET_RATES]
+            active_kpi_pool = (
+                [{"name": m, "type": "number"} for m in s_metrics if m in f_df_global.columns] +
+                [{"name": r, "type": "rate"} for r in selected_rate_names if r in PRESET_RATES]
+            )
             if show_cvr and cvr_name:
                 active_kpi_pool.append({"name": cvr_name, "type": "rate"})
             if not active_kpi_pool:
-                active_kpi_pool = [{"name": c, "type": "number"} for c in ["广告主激活量", "下单量", "新登量"] if c in f_df_global.columns]
+                active_kpi_pool = [{"name": c, "type": "number"}
+                                   for c in ["广告主激活量", "下单量", "新登量"] if c in f_df_global.columns]
 
             kpi_cols = st.columns(min(len(active_kpi_pool), 4))
             card_colors = ["#1F77B4", "#FF7F0E", "#2CA02C", "#9467BD"]
@@ -716,6 +805,13 @@ if st.session_state["cleaned_data"] is not None:
         # ===================== Tab视图 =====================
         tab1, tab2, tab3 = st.tabs(["1️⃣ 配置号明细", "2️⃣ 媒体平台明细", "3️⃣ 调度ID明细"])
 
+        render_kwargs = dict(
+            selected_rate_names=selected_rate_names,
+            show_cvr=show_cvr, cvr_name=cvr_name,
+            s_metrics=s_metrics,
+            enable_alert=enable_alert, alert_rules=alert_rules,
+        )
+
         with tab1:
             st.subheader("配置号分析视角")
             render_dataframe(
@@ -723,58 +819,42 @@ if st.session_state["cleaned_data"] is not None:
                 ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
                 w1,
                 table_key="配置号明细",
-                insert_owner=False
+                insert_owner=False,
+                **render_kwargs,
             )
 
         with tab2:
             st.subheader("媒体平台分析视角")
-            all_media_list = sorted(f_df_global["媒体平台名称"].unique().tolist()) if ("媒体平台名称" in f_df_global.columns and not f_df_global.empty) else []
-            selected_tab2_media = st.multiselect("🎯 【Tab 2 专属】快速过滤媒体平台", options=all_media_list, default=all_media_list, key="tab2_media_filter")
-            f_df_tab2 = f_df_global[f_df_global["媒体平台名称"].isin(selected_tab2_media)] if (selected_tab2_media and not f_df_global.empty) else f_df_global
-            res2, w2 = process_view(["产品", "广告主平台配置名称", "媒体平台名称"], f_df_tab2)
-
-            if not res2.empty and "媒体平台名称" in res2.columns:
-                tab2_summary_rows = res2[res2["日期"] == "✨ 汇总"] if "日期" in res2.columns else res2
-                tab2_media_active = tab2_summary_rows[tab2_summary_rows["媒体平台名称"] != "✨ 汇总"]["媒体平台名称"].unique().tolist()
-                st.markdown(f"💡 **当前 Tab 2 动态过滤后**：共生效 **{len(tab2_media_active)}** 个媒体平台：`{' / '.join(tab2_media_active) if tab2_media_active else '无'}`")
-            else:
-                st.markdown("💡 **当前 Tab 2 动态过滤后**：无匹配媒体数据")
-
+            res2, w2 = process_view(
+                ("产品", "广告主平台配置名称", "媒体平台名称"),
+                f_df_global,
+                show_daily, show_cvr, c_num, c_den, cvr_name,
+                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
+            )
             render_dataframe(
                 res2,
                 ["产品", "广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []),
                 w2,
                 table_key="媒体平台明细",
-                insert_owner=False
+                insert_owner=False,
+                **render_kwargs,
             )
 
         with tab3:
             st.subheader("调度ID分析视角")
-            all_id_list = sorted(f_df_global["调度中心ID"].unique().tolist()) if ("调度中心ID" in f_df_global.columns and not f_df_global.empty) else []
-            selected_tab3_ids = st.multiselect("🎯 【Tab 3 专属】快速限定调度中心ID", options=all_id_list,
-                                               default=all_id_list[:min(10, len(all_id_list))] if all_id_list else [],
-                                               key="tab3_id_filter")
-            f_df_tab3 = f_df_global[f_df_global["调度中心ID"].isin(selected_tab3_ids)] if (selected_tab3_ids and not f_df_global.empty) else f_df_global
-            res3, w3 = process_view(["产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"], f_df_tab3)
-
-            # Tab3统计文字
-            id_detail = "当前筛选无匹配调度ID"
-            if not res3.empty and "调度中心ID" in res3.columns and "媒体平台名称" in res3.columns:
-                sub_t3 = res3[res3["日期"] == "✨ 汇总"] if "日期" in res3.columns else res3
-                sub_t3_filtered = sub_t3[(sub_t3["媒体平台名称"] != "✨ 汇总") & (sub_t3["调度中心ID"] != "✨ 汇总")]
-                if not sub_t3_filtered.empty:
-                    media_id_count = sub_t3_filtered.groupby("媒体平台名称")["调度中心ID"].nunique().reset_index()
-                    media_id_count["激活量"] = sub_t3_filtered.groupby("媒体平台名称")["广告主激活量"].sum().values if "广告主激活量" in sub_t3_filtered.columns else 0
-                    id_detail = " ｜ ".join([f"**{row['媒体平台名称']}** ({row['调度中心ID']}个ID)" for _, row in media_id_count.sort_values("激活量", ascending=False).iterrows()])
-            st.markdown(f"🆔 **当前 Tab 3 专属统计**：{id_detail}")
-
-            # Tab3开启负责人插入
+            res3, w3 = process_view(
+                ("产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"),
+                f_df_global,
+                show_daily, show_cvr, c_num, c_den, cvr_name,
+                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
+            )
             render_dataframe(
                 res3,
                 ["产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []),
                 w3,
                 table_key="调度ID明细",
-                insert_owner=True
+                insert_owner=True,
+                **render_kwargs,
             )
 
     except Exception as e:
