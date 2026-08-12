@@ -58,11 +58,11 @@ BASE_CACHE_DIR = ".streamlit_file_cache"
 
 # ====================== 工具函数 ======================
 
-def _clean_name_like_raw(x):
-    """和底表 clean_name 完全一致的截断逻辑 — 飞书配置也用这个，确保两边 key 匹配"""
-    if pd.isna(x): return ""
+def clean_name(x, default="未知"):
+    """统一的配置名截断函数 — 底表清洗和飞书配置匹配共用，确保两边 key 永远一致"""
+    if pd.isna(x): return default
     s = str(x).strip()
-    if s == "" or s.lower() == "nan": return ""
+    if s == "" or s.lower() == "nan": return default
     return s.split('_', 1)[-1] if '_' in s else s
 
 
@@ -121,7 +121,7 @@ def load_feishu_price_config():
             st.error(f"飞书表格缺少必要列: {missing}，实际列: {list(df_config.columns)}")
             return empty_df
 
-        df_config["广告主配置"] = df_config["广告主配置"].apply(_clean_name_like_raw)
+        df_config["广告主配置"] = df_config["广告主配置"].apply(lambda x: clean_name(x, default=""))
         df_config["单价"] = pd.to_numeric(df_config["单价"], errors="coerce").fillna(0)
         df_config["回传维度"] = df_config["回传维度"].astype(str).str.strip()
         df_config = df_config[df_config["广告主配置"] != ""]
@@ -135,7 +135,7 @@ def load_feishu_price_config():
         return empty_df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def _get_product_config():
     """懒加载：只在第一次使用时读文件"""
     config_path = "products_config.json"
@@ -177,7 +177,7 @@ def extract_faction_and_product(config_name, match_rules, default_faction, defau
     return default_faction, default_product
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_and_clean_data_cached(file_contents, file_name):
     """读取上传文件、统一清洗格式，生成标准化底表"""
     import io
@@ -200,12 +200,6 @@ def load_and_clean_data_cached(file_contents, file_name):
     raw_df.columns = raw_df.columns.str.strip()
     if '广告主平台' in raw_df.columns and '广告主平台名称' not in raw_df.columns:
         raw_df.rename(columns={'广告主平台': '广告主平台名称'}, inplace=True)
-
-    def clean_name(x):
-        if pd.isna(x): return "未知"
-        s = str(x).strip()
-        if s == "" or s.lower() == "nan": return "未知"
-        return s.split('_', 1)[-1] if '_' in s else s
 
     for col in ['广告主平台名称', '媒体平台名称', '广告主平台配置名称']:
         if col in raw_df.columns:
@@ -261,7 +255,7 @@ def load_and_clean_data_cached(file_contents, file_name):
     return raw_df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def get_filtered_dataframe(base_df, start_date, end_date,
                            factions: tuple, products: tuple, platforms: tuple,
                            configs: tuple, media: tuple, ids: tuple, owners: tuple):
@@ -277,7 +271,7 @@ def get_filtered_dataframe(base_df, start_date, end_date,
     return base_df[mask]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def merge_price_and_calc_settle(df_raw, df_price_config):
     """单价合并 + 结算金额计算 — 独立缓存，单价配置不变时秒返回"""
     work_df = df_raw.copy()
@@ -308,7 +302,7 @@ def merge_price_and_calc_settle(df_raw, df_price_config):
     return work_df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def process_view(
     dims: tuple,
     src_df: pd.DataFrame,
@@ -457,60 +451,70 @@ def _build_disp_df(res_df, base_dims, wow_cols, table_rates, s_metrics, insert_o
     return res_df[disp_cols].copy(), disp_cols
 
 
-@st.cache_data(show_spinner=False)
-def _compute_style_matrix(
-    disp_df,
-    disp_cols,
-    wow_cols: tuple,
+@st.cache_data(show_spinner=False, ttl=300)
+def _compute_styles(
+    disp_cols: tuple,
+    n_rows: int,
+    total_summary_mask: tuple,
+    group_summary_mask: tuple,
+    wow_up_mask: tuple,
+    wow_down_mask: tuple,
+    wow_col_names: tuple,
     enable_alert: bool,
     alert_rules: tuple,
+    alert_masks: tuple,
 ):
-    """纯计算：生成样式矩阵 — 样式配置不变时命中缓存"""
-    style_matrix = pd.DataFrame("", index=disp_df.index, columns=disp_df.columns)
+    """稀疏存储：只返回有样式的 (row_idx, col_name, css_string) 列表，不缓存空字符串矩阵"""
+    styles = {}
+    empty_series = pd.Series([], dtype=object)
 
-    mask_total_summary = pd.Series(False, index=disp_df.index)
-    if "广告主平台配置名称" in disp_df.columns:
-        mask_total_summary |= disp_df["广告主平台配置名称"].str.contains("【全配置号汇总】", na=False)
-    if "派系" in disp_df.columns:
-        mask_total_summary |= disp_df["派系"].str.contains("【全大盘派系汇总】", na=False)
+    def add(row_idx, col_name, css):
+        key = (row_idx, col_name)
+        if key in styles:
+            existing = styles[key]
+            if css not in existing:
+                styles[key] = existing + " " + css
+        else:
+            styles[key] = css
 
-    mask_group_summary = pd.Series(False, index=disp_df.index)
-    if "日期" in disp_df.columns:
-        mask_group_summary = (disp_df["日期"] == "✨ 汇总") & (~mask_total_summary)
-
-    style_matrix.loc[mask_total_summary, :] = "background-color: #FFF2CC; font-weight: bold; color: #D68910;"
-    style_matrix.loc[mask_group_summary, :] = "background-color: #E6F3FF; font-weight: bold; color: #1f77b4;"
+    total_mask = pd.Series(total_summary_mask)
+    group_mask = pd.Series(group_summary_mask)
+    for col in disp_cols:
+        rows_t = total_mask[total_mask].index.tolist()
+        rows_g = group_mask[group_mask].index.tolist()
+        for r in rows_t:
+            add(r, col, "background-color: #FFF2CC; font-weight: bold; color: #D68910;")
+        for r in rows_g:
+            add(r, col, "background-color: #E6F3FF; font-weight: bold; color: #1f77b4;")
 
     if enable_alert and alert_rules:
-        for rule in alert_rules:
-            target, logi, threshold = rule['target'], rule['logic'], rule['val']
+        for rule, mask_tuple in zip(alert_rules, alert_masks):
+            target = rule['target']
             if target not in disp_cols:
                 continue
-            series = disp_df[target].astype(float)
-            cond = False
-            if logi == "<": cond = series < threshold
-            elif logi == "<=": cond = series <= threshold
-            elif logi == ">": cond = series > threshold
-            elif logi == ">=": cond = series >= threshold
-            elif logi == "==": cond = np.isclose(series, threshold, atol=1e-6)
-            style_matrix.loc[cond, target] = "color: white; font-weight: bold; background-color: #FF4B4B;"
+            alert_mask = pd.Series(mask_tuple)
+            for r in alert_mask[alert_mask].index.tolist():
+                add(r, target, "color: white; font-weight: bold; background-color: #FF4B4B;")
 
-    for w_col in wow_cols:
+    wow_up = pd.Series(wow_up_mask)
+    wow_down = pd.Series(wow_down_mask)
+    for idx, w_col in enumerate(wow_col_names):
         if w_col not in disp_cols:
             continue
-        series = disp_df[w_col].astype(float)
-        mask_up = series > 0
-        mask_down = series < 0
-        style_matrix.loc[mask_up & (style_matrix[w_col] == ""), w_col] += "color: #d00000; font-weight: bold;"
-        style_matrix.loc[mask_down & (style_matrix[w_col] == ""), w_col] += "color: #008000; font-weight: bold;"
+        up_rows = wow_up[wow_up].index.tolist()
+        down_rows = wow_down[wow_down].index.tolist()
+        for r in up_rows:
+            add(r, w_col, "color: #d00000; font-weight: bold;")
+        for r in down_rows:
+            add(r, w_col, "color: #008000; font-weight: bold;")
 
-    return style_matrix.reset_index(drop=True)
+    return styles
 
 
 def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_owner=False,
                      selected_rate_names=None, show_cvr=False, cvr_name=None,
                      s_metrics=None, enable_alert=False, alert_rules=None):
-    """统一表格渲染 — 样式计算部分已拆分并可缓存"""
+    """统一表格渲染 — 样式计算稀疏化，避免缓存爆炸"""
     if res_df.empty:
         return st.info("所选筛选条件下无数据")
 
@@ -521,18 +525,65 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + list(wow_cols)
     disp_df, disp_cols = _build_disp_df(res_df, base_dims, list(wow_cols), table_rates, list(s_metrics), insert_owner)
 
-    style_matrix = _compute_style_matrix(
-        disp_df,
-        disp_cols,
+    disp_df = disp_df.reset_index(drop=True)
+
+    mask_total_summary = pd.Series(False, index=disp_df.index)
+    if "广告主平台配置名称" in disp_df.columns:
+        mask_total_summary |= disp_df["广告主平台配置名称"].str.contains("【全配置号汇总】", na=False)
+    if "派系" in disp_df.columns:
+        mask_total_summary |= disp_df["派系"].str.contains("【全大盘派系汇总】", na=False)
+    mask_group_summary = pd.Series(False, index=disp_df.index)
+    if "日期" in disp_df.columns:
+        mask_group_summary = (disp_df["日期"] == "✨ 汇总") & (~mask_total_summary)
+
+    wow_up_mask = pd.Series(False, index=disp_df.index)
+    wow_down_mask = pd.Series(False, index=disp_df.index)
+    for w_col in wow_cols:
+        if w_col not in disp_cols:
+            continue
+        series = disp_df[w_col].astype(float)
+        wow_up_mask |= series > 0
+        wow_down_mask |= series < 0
+    wow_down_mask &= ~wow_up_mask
+
+    alert_masks = []
+    for rule in alert_rules:
+        target, logi, threshold = rule['target'], rule['logic'], rule['val']
+        if target not in disp_cols:
+            alert_masks.append(tuple())
+            continue
+        series = disp_df[target].astype(float)
+        cond = False
+        if logi == "<": cond = series < threshold
+        elif logi == "<=": cond = series <= threshold
+        elif logi == ">": cond = series > threshold
+        elif logi == ">=": cond = series >= threshold
+        elif logi == "==": cond = np.isclose(series, threshold, atol=1e-6)
+        alert_masks.append(tuple(cond))
+
+    styles_map = _compute_styles(
+        tuple(disp_cols),
+        len(disp_df),
+        tuple(mask_total_summary),
+        tuple(mask_group_summary),
+        tuple(wow_up_mask),
+        tuple(wow_down_mask),
         tuple(wow_cols),
         enable_alert,
         tuple(alert_rules),
+        tuple(alert_masks),
     )
 
-    disp_df = disp_df.reset_index(drop=True)
+    empty_row = tuple([""] * len(disp_cols))
 
     def row_styler(_row):
-        return style_matrix.loc[_row.name].tolist()
+        styles = list(empty_row)
+        for (r_idx, c_name), css in styles_map.items():
+            if r_idx == _row.name and c_name in disp_cols:
+                c_pos = disp_cols.index(c_name)
+                existing = styles[c_pos]
+                styles[c_pos] = (existing + " " + css) if existing else css
+        return tuple(styles)
 
     styler = disp_df.style.apply(row_styler, axis=1)
 
@@ -779,7 +830,9 @@ if st.session_state["cleaned_data"] is not None:
         # KPI顶部卡片
         if not f_df_global.empty:
             active_kpi_pool = (
-                [{"name": m, "type": "number"} for m in s_metrics if m in f_df_global.columns] +
+                [{"name": "结算金额", "type": "number"}] if "结算金额" in f_df_global.columns else []
+            ) + (
+                [{"name": m, "type": "number"} for m in s_metrics if m in f_df_global.columns and m not in ("单价", "结算金额")] +
                 [{"name": r, "type": "rate"} for r in selected_rate_names if r in PRESET_RATES]
             )
             if show_cvr and cvr_name:
@@ -789,22 +842,18 @@ if st.session_state["cleaned_data"] is not None:
                                    for c in ["广告主激活量", "下单量", "新登量"] if c in f_df_global.columns]
 
             kpi_cols = st.columns(min(len(active_kpi_pool), 4))
-            card_colors = ["#1F77B4", "#FF7F0E", "#2CA02C", "#9467BD"]
             for idx, kpi in enumerate(active_kpi_pool[:4]):
                 name, kpi_type = kpi["name"], kpi["type"]
-                color = card_colors[idx % 4]
                 with kpi_cols[idx]:
                     if kpi_type == "number":
                         label = "总结算金额" if name == "结算金额" else f"周期总 {name}"
                         if name in ("单价",):
-                            total_val = f"{f_df_global[name].mean():.4f}" if f_df_global[name].sum() > 0 else "0"
+                            val = f"{f_df_global[name].mean():.4f}" if f_df_global[name].sum() > 0 else "0"
                         elif name == "结算金额":
-                            total_val = f"{pd.to_numeric(f_df_global[name], errors='coerce').sum():,.2f}"
+                            val = f"{pd.to_numeric(f_df_global[name], errors='coerce').sum():,.2f}"
                         else:
-                            total_val = f"{int(f_df_global[name].sum()):,}"
-                        st.markdown(
-                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📊 {label}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{total_val}</h3></div>',
-                            unsafe_allow_html=True)
+                            val = f"{int(f_df_global[name].sum()):,}"
+                        st.metric(label=f"📊 {label}", value=val)
                     else:
                         if name in PRESET_RATES:
                             n_col, d_col = PRESET_RATES[name]
@@ -820,9 +869,7 @@ if st.session_state["cleaned_data"] is not None:
                             rate_val = (raw_n / raw_d * 100) if raw_d > 1e-9 else 0.0
                         else:
                             rate_val = res1[name].iloc[0] if not res1.empty and name in res1.columns else 0.0
-                        st.markdown(
-                            f'<div style="background-color: #F8F9FA; padding: 15px; border-radius: 8px; border-left: 5px solid {color}; box-shadow: 2px 2px 8px rgba(0,0,0,0.04);"> <span style="font-size: 13px; color: #666; font-weight: 500;">📈 大盘综合 {name}</span> <h3 style="margin: 3px 0 0 0; color: #2C3E50; font-size: 24px;">{rate_val:.2f}%</h3></div>',
-                            unsafe_allow_html=True)
+                        st.metric(label=f"📈 大盘综合 {name}", value=f"{rate_val:.2f}%")
             st.write("")
 
         # ===================== Tab视图 =====================
@@ -835,10 +882,12 @@ if st.session_state["cleaned_data"] is not None:
             enable_alert=enable_alert, alert_rules=alert_rules,
         )
 
+        MAX_ROWS = 700
+
         with tab1:
             st.subheader("配置号分析视角")
             render_dataframe(
-                res1.head(700) if not res1.empty else res1,
+                res1.head(MAX_ROWS) if not res1.empty else res1,
                 ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
                 w1,
                 table_key="配置号明细",
@@ -855,7 +904,7 @@ if st.session_state["cleaned_data"] is not None:
                 enable_wow, tuple(wow_targets_list), tuple(s_metrics)
             )
             render_dataframe(
-                res2,
+                res2.head(MAX_ROWS) if not res2.empty else res2,
                 ["产品", "广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []),
                 w2,
                 table_key="媒体平台明细",
@@ -872,7 +921,7 @@ if st.session_state["cleaned_data"] is not None:
                 enable_wow, tuple(wow_targets_list), tuple(s_metrics)
             )
             render_dataframe(
-                res3,
+                res3.head(MAX_ROWS) if not res3.empty else res3,
                 ["产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []),
                 w3,
                 table_key="调度ID明细",
