@@ -4,7 +4,6 @@ import numpy as np
 import json
 import os
 import re
-import uuid
 import extra_streamlit_components as stx
 import requests
 
@@ -53,8 +52,6 @@ SPECIAL_MAPPING = {
     "七猫免费小说": {"派系": "其他派系", "特征": ["七猫", "七猫免费小说"]},
     "soul": {"派系": "其他派系", "特征": ["Soul", "soul"]}
 }
-
-BASE_CACHE_DIR = ".streamlit_file_cache"
 
 # ====================== 工具函数 ======================
 
@@ -232,6 +229,10 @@ def load_and_clean_data_cached(file_contents, file_name):
     num_cols = raw_df.select_dtypes(include=['number']).columns.tolist()
     for col in num_cols:
         raw_df[col] = pd.to_numeric(raw_df[col], errors='coerce').fillna(0)
+        if raw_df[col].dtype == np.float64:
+            raw_df[col] = raw_df[col].astype(np.float32)
+        elif raw_df[col].dtype == np.int64:
+            raw_df[col] = raw_df[col].astype(np.int32)
 
     cond_times = raw_df['媒体上报次数'] < 20 if '媒体上报次数' in raw_df.columns else True
     cond_exp = raw_df['媒体上报曝光数'] < 20 if '媒体上报曝光数' in raw_df.columns else True
@@ -627,58 +628,9 @@ cookie_manager = stx.CookieManager()
 if cookie_manager.get_all() is None:
     st.stop()
 
-user_uuid = cookie_manager.get("persistent_user_uuid")
-if not user_uuid:
-    user_uuid = str(uuid.uuid4())
-    cookie_manager.set("persistent_user_uuid", user_uuid, max_age=365 * 24 * 60 * 60)
-
-USER_CACHE_DIR = os.path.join(BASE_CACHE_DIR, user_uuid)
-os.makedirs(BASE_CACHE_DIR, exist_ok=True)
-os.makedirs(USER_CACHE_DIR, exist_ok=True)
-
-CACHE_FILE = os.path.join(USER_CACHE_DIR, "last_processed_data.feather")
-META_FILE = os.path.join(USER_CACHE_DIR, "cache_metadata.json")
-
-
-def load_from_local_cache():
-    if os.path.exists(CACHE_FILE) and os.path.exists(META_FILE):
-        try:
-            with open(META_FILE, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            df = pd.read_feather(CACHE_FILE)
-            return df, meta.get("file_name")
-        except Exception:
-            return None, None
-    return None, None
-
-
-def save_to_local_cache(df, file_name):
-    try:
-        df.to_feather(CACHE_FILE, compression="zstd")
-        with open(META_FILE, "w", encoding="utf-8") as f:
-            json.dump({"file_name": file_name}, f)
-    except Exception as e:
-        st.warning(f"本地硬盘缓存写入失败: {e}")
-
-
 if "cleaned_data" not in st.session_state:
-    cached_df, cached_name = load_from_local_cache()
-    if cached_df is not None:
-        temp_df = cached_df
-        for col_name in ["单价", "回传维度", "结算金额"]:
-            if col_name not in temp_df.columns:
-                if col_name == "单价":
-                    temp_df["单价"] = 0
-                elif col_name == "回传维度":
-                    temp_df["回传维度"] = "未配置"
-                else:
-                    temp_df["结算金额"] = 0
-        st.session_state["cleaned_data"] = temp_df
-        st.session_state["file_name"] = cached_name
-    else:
-        st.session_state["cleaned_data"] = None
-        st.session_state["file_name"] = None
-
+    st.session_state["cleaned_data"] = None
+    st.session_state["file_name"] = None
 
 col_upload, col_clear = st.columns([4, 1])
 with col_upload:
@@ -686,8 +638,6 @@ with col_upload:
 with col_clear:
     st.write("#")
     if st.button("🗑️ 清除缓存数据", use_container_width=True):
-        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
-        if os.path.exists(META_FILE): os.remove(META_FILE)
         st.cache_data.clear()
         st.session_state["cleaned_data"] = None
         st.session_state["file_name"] = None
@@ -700,13 +650,12 @@ if uploaded_file:
             df_cleaned = load_and_clean_data_cached(file_bytes, uploaded_file.name)
             st.session_state["cleaned_data"] = df_cleaned
             st.session_state["file_name"] = uploaded_file.name
-            save_to_local_cache(df_cleaned, uploaded_file.name)
             status.update(label="✅ 数据分析加载完成", state="complete", expanded=False)
         st.toast(f"成功加载文件: {uploaded_file.name}", icon="🔥")
 
 if st.session_state["cleaned_data"] is not None:
     try:
-        st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}` (已启用长效 Cookie 隔离与断线自动恢复缓存)")
+        st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}`")
 
         with st.sidebar:
             st.markdown("<h3 style='color: #1F77B4;'>💰 飞书配置</h3>", unsafe_allow_html=True)
@@ -820,14 +769,7 @@ if st.session_state["cleaned_data"] is not None:
             tuple(t_configs), tuple(t_media), tuple(t_ids), tuple(t_owners)
         )
 
-        res1, w1 = process_view(
-            ("派系", "产品", "广告主平台名称", "广告主平台配置名称"),
-            f_df_global,
-            show_daily, show_cvr, c_num, c_den, cvr_name,
-            enable_wow, tuple(wow_targets_list), tuple(s_metrics)
-        )
-
-        # KPI顶部卡片
+        # KPI顶部卡片（只用 f_df_global 聚合，不依赖 process_view）
         if not f_df_global.empty:
             active_kpi_pool = (
                 [{"name": "结算金额", "type": "number"}] if "结算金额" in f_df_global.columns else []
@@ -868,11 +810,11 @@ if st.session_state["cleaned_data"] is not None:
                             raw_d = pd.to_numeric(f_df_global[c_den], errors='coerce').sum()
                             rate_val = (raw_n / raw_d * 100) if raw_d > 1e-9 else 0.0
                         else:
-                            rate_val = res1[name].iloc[0] if not res1.empty and name in res1.columns else 0.0
+                            rate_val = 0.0
                         st.metric(label=f"📈 大盘综合 {name}", value=f"{rate_val:.2f}%")
             st.write("")
 
-        # ===================== Tab视图 =====================
+        # ===================== Tab视图（全懒加载） =====================
         tab1, tab2, tab3 = st.tabs(["1️⃣ 配置号明细", "2️⃣ 媒体平台明细", "3️⃣ 调度ID明细"])
 
         render_kwargs = dict(
@@ -886,6 +828,12 @@ if st.session_state["cleaned_data"] is not None:
 
         with tab1:
             st.subheader("配置号分析视角")
+            res1, w1 = process_view(
+                ("派系", "产品", "广告主平台名称", "广告主平台配置名称"),
+                f_df_global,
+                show_daily, show_cvr, c_num, c_den, cvr_name,
+                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
+            )
             render_dataframe(
                 res1.head(MAX_ROWS) if not res1.empty else res1,
                 ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
