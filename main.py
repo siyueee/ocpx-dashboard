@@ -4,6 +4,7 @@ import numpy as np
 import json
 import os
 import re
+import uuid
 import shutil
 import datetime
 import extra_streamlit_components as stx
@@ -86,12 +87,16 @@ def _user_dir(session_id):
 @st.cache_data(show_spinner=True, ttl=300)
 def load_feishu_price_config():
     """读取飞书多维表格配置，缓存5分钟自动刷新"""
-    app_id = st.secrets["feishu"]["app_id"]
-    app_secret = st.secrets["feishu"]["app_secret"]
-    spreadsheet_token = st.secrets["feishu"]["spreadsheet_token"]
-    sheet_id = st.secrets["feishu"]["sheet_id"]
-
     empty_df = pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
+    try:
+        feishu_config = st.secrets["feishu"]
+        app_id = feishu_config["app_id"]
+        app_secret = feishu_config["app_secret"]
+        spreadsheet_token = feishu_config["spreadsheet_token"]
+        sheet_id = feishu_config["sheet_id"]
+    except (FileNotFoundError, KeyError):
+        st.warning("未配置本地飞书 Secrets，已跳过单价配置读取。")
+        return empty_df
 
     try:
         token_res = requests.post(
@@ -457,11 +462,11 @@ def process_view(
 
 # ====================== 表格渲染 ======================
 
-def _build_disp_df(res_df, base_dims, wow_cols, table_rates, s_metrics, insert_owner):
+def _build_disp_df(res_df, base_dims, wow_cols, table_rates, s_metrics, insert_owner, show_price=True):
     """纯函数：根据配置生成展示列 DataFrame"""
     base_cols = [d for d in base_dims if d in res_df.columns]
     target_metrics = [c for c in s_metrics if c in res_df.columns and c not in ("单价", "结算金额")]
-    special_cols = [c for c in ("单价", "结算金额") if c in res_df.columns]
+    special_cols = [c for c in ("单价", "结算金额") if c in res_df.columns and (c != "单价" or show_price)]
 
     disp_cols = base_cols.copy()
     if insert_owner and "调度中心ID" in disp_cols and "负责人" in res_df.columns:
@@ -532,7 +537,7 @@ def _compute_styles(
     return styles
 
 
-def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_owner=False,
+def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_owner=False, show_price=True,
                      selected_rate_names=None, show_cvr=False, cvr_name=None,
                      s_metrics=None, enable_alert=False, alert_rules=None):
     """统一表格渲染 — 样式计算稀疏化，避免缓存爆炸"""
@@ -544,7 +549,7 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     alert_rules = alert_rules or []
 
     table_rates = selected_rate_names + ([cvr_name] if show_cvr else []) + list(wow_cols)
-    disp_df, disp_cols = _build_disp_df(res_df, base_dims, list(wow_cols), table_rates, list(s_metrics), insert_owner)
+    disp_df, disp_cols = _build_disp_df(res_df, base_dims, list(wow_cols), table_rates, list(s_metrics), insert_owner, show_price)
 
     disp_df = disp_df.reset_index(drop=True)
 
@@ -615,8 +620,10 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
         c_config["负责人"] = st.column_config.TextColumn(width="small")
     for r_col in [r for r in table_rates if r in disp_df.columns]:
         c_config[r_col] = st.column_config.NumberColumn(format="%.2f%%", width="small")
+    for price_col in [c for c in ("单价", "结算金额") if c in disp_df.columns]:
+        c_config[price_col] = st.column_config.NumberColumn(format="%,.1f", width="small")
     for m_col in [c for c in s_metrics if c in disp_df.columns]:
-        c_config[m_col] = st.column_config.NumberColumn(format="%d")
+        c_config[m_col] = st.column_config.NumberColumn(format="%,d")
 
     dynamic_height = min(35 * len(disp_df) + 40, 700)
     st.dataframe(
@@ -642,6 +649,39 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
 st.set_page_config(page_title="OCPX业务数据全维度分析看板", layout="wide", initial_sidebar_state="expanded")
 st.markdown("<h2 style='text-align: center; color: #1F77B4;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; color: #666;'>欢迎提出使用建议~🍦</p>", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+.view-switch-label {
+    color: #1F77B4;
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin: 1.25rem 0 0.25rem;
+}
+.st-key-view_tab_product button, .st-key-view_tab_config button, .st-key-view_tab_media button, .st-key-view_tab_dispatch button {
+    min-height: 3.15rem;
+    border-radius: 0.75rem;
+    border: 1px solid #d8e6f5;
+    background: #f7fbff;
+    color: #3d607c;
+    font-weight: 650;
+    transition: all 0.18s ease;
+}
+.st-key-view_tab_product button:hover, .st-key-view_tab_config button:hover, .st-key-view_tab_media button:hover, .st-key-view_tab_dispatch button:hover {
+    border-color: #78afe0;
+    background: #edf6ff;
+    color: #1F77B4;
+    transform: translateY(-1px);
+}
+.st-key-view_tab_product button[kind="primary"], .st-key-view_tab_config button[kind="primary"], .st-key-view_tab_media button[kind="primary"], .st-key-view_tab_dispatch button[kind="primary"] {
+    border-color: #1F77B4;
+    background: linear-gradient(135deg, #1F77B4, #3293d0);
+    color: #ffffff;
+    box-shadow: 0 5px 14px rgba(31, 119, 180, 0.2);
+}
+</style>
+""", unsafe_allow_html=True)
 st.divider()
 
 cookie_manager = stx.CookieManager()
@@ -865,8 +905,29 @@ if st.session_state["cleaned_data"] is not None:
                         st.metric(label=f"📈 大盘综合 {name}", value=f"{rate_val:.2f}%")
             st.write("")
 
-        # ===================== Tab视图（全懒加载） =====================
-        tab1, tab2, tab3 = st.tabs(["1️⃣ 配置号明细", "2️⃣ 媒体平台明细", "3️⃣ 调度ID明细"])
+        if "selected_view" not in st.session_state:
+            st.session_state["selected_view"] = "配置号明细"
+
+        st.markdown("<div class='view-switch-label'>明细分析视图</div>", unsafe_allow_html=True)
+        view_options = [
+            ("产品明细", "view_tab_product", "① 产品明细", "产品与日期"),
+            ("配置号明细", "view_tab_config", "② 配置号明细", "配置号维度"),
+            ("媒体平台明细", "view_tab_media", "③ 媒体平台明细", "媒体维度"),
+            ("调度ID明细", "view_tab_dispatch", "④ 调度ID明细", "调度维度"),
+        ]
+        tab_columns = st.columns(4, gap="small")
+        for column, (label, key, button_label, description) in zip(tab_columns, view_options):
+            with column:
+                st.caption(description)
+                if st.button(
+                    button_label,
+                    key=key,
+                    use_container_width=True,
+                    type="primary" if st.session_state["selected_view"] == label else "secondary",
+                ):
+                    st.session_state["selected_view"] = label
+                    st.rerun()
+        selected_view = st.session_state["selected_view"]
 
         render_kwargs = dict(
             selected_rate_names=selected_rate_names,
@@ -875,58 +936,58 @@ if st.session_state["cleaned_data"] is not None:
             enable_alert=enable_alert, alert_rules=alert_rules,
         )
 
-        MAX_ROWS = 700
-
-        with tab1:
-            st.subheader("配置号分析视角")
-            res1, w1 = process_view(
-                ("派系", "产品", "广告主平台名称", "广告主平台配置名称"),
-                f_df_global,
-                show_daily, show_cvr, c_num, c_den, cvr_name,
-                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
-            )
-            render_dataframe(
-                res1.head(MAX_ROWS) if not res1.empty else res1,
-                ["派系", "产品", "广告主平台名称", "广告主平台配置名称"] + (["日期"] if show_daily else []),
-                w1,
-                table_key="配置号明细",
-                insert_owner=False,
-                **render_kwargs,
-            )
-
-        with tab2:
-            st.subheader("媒体平台分析视角")
-            res2, w2 = process_view(
-                ("产品", "广告主平台配置名称", "媒体平台名称"),
-                f_df_global,
-                show_daily, show_cvr, c_num, c_den, cvr_name,
-                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
-            )
-            render_dataframe(
-                res2.head(MAX_ROWS) if not res2.empty else res2,
-                ["产品", "广告主平台配置名称", "媒体平台名称"] + (["日期"] if show_daily else []),
-                w2,
-                table_key="媒体平台明细",
-                insert_owner=False,
-                **render_kwargs,
-            )
-
-        with tab3:
-            st.subheader("调度ID分析视角")
-            res3, w3 = process_view(
-                ("产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"),
-                f_df_global,
-                show_daily, show_cvr, c_num, c_den, cvr_name,
-                enable_wow, tuple(wow_targets_list), tuple(s_metrics)
-            )
-            render_dataframe(
-                res3.head(MAX_ROWS) if not res3.empty else res3,
-                ["产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"] + (["日期"] if show_daily else []),
-                w3,
-                table_key="调度ID明细",
-                insert_owner=True,
-                **render_kwargs,
-            )
+        view_options = {
+            "产品明细": {
+                "title": "产品分析视角",
+                "dims": ("产品",),
+                "base_dims": ["产品"],
+                "insert_owner": False,
+                "show_daily": True,
+                "show_price": False,
+            },
+            "配置号明细": {
+                "title": "配置号分析视角",
+                "dims": ("派系", "产品", "广告主平台名称", "广告主平台配置名称"),
+                "base_dims": ["派系", "产品", "广告主平台名称", "广告主平台配置名称"],
+                "insert_owner": False,
+                "show_daily": show_daily,
+                "show_price": True,
+            },
+            "媒体平台明细": {
+                "title": "媒体平台分析视角",
+                "dims": ("产品", "广告主平台配置名称", "媒体平台名称"),
+                "base_dims": ["产品", "广告主平台配置名称", "媒体平台名称"],
+                "insert_owner": False,
+                "show_daily": show_daily,
+                "show_price": True,
+            },
+            "调度ID明细": {
+                "title": "调度ID分析视角",
+                "dims": ("产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"),
+                "base_dims": ["产品", "广告主平台配置名称", "媒体平台名称", "调度中心ID"],
+                "insert_owner": True,
+                "show_daily": show_daily,
+                "show_price": True,
+            },
+        }
+        view = view_options[selected_view]
+        st.caption("切换时仅计算当前视图，可减少大数据量下的等待时间。")
+        st.subheader(view["title"])
+        result, wow_cols = process_view(
+            view["dims"],
+            f_df_global,
+            view["show_daily"], show_cvr, c_num, c_den, cvr_name,
+            enable_wow, tuple(wow_targets_list), tuple(s_metrics)
+        )
+        render_dataframe(
+            result.head(700) if not result.empty else result,
+            view["base_dims"] + (["日期"] if view["show_daily"] else []),
+            wow_cols,
+            table_key=selected_view,
+            insert_owner=view["insert_owner"],
+            show_price=view["show_price"],
+            **render_kwargs,
+        )
 
     except Exception as e:
         st.error(f"处理出现技术错误: {e}")
