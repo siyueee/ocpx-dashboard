@@ -1,6 +1,7 @@
 streamlit
 pandas
 numpy
+plotly
 openpyxl
 python-calamine
 extra-streamlit-components

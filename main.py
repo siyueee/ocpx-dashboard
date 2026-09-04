@@ -1,4 +1,5 @@
 import streamlit as st
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import json
@@ -84,9 +85,9 @@ def get_or_create_session_id(cookie_manager):
 
 def _user_dir(session_id):
     return os.path.join(UPLOADED_DIR, session_id)
-@st.cache_data(show_spinner=True, ttl=300)
+@st.cache_data(show_spinner=True, ttl=86400)
 def load_feishu_price_config():
-    """读取飞书多维表格配置，缓存5分钟自动刷新"""
+    """读取飞书多维表格配置，每天自动刷新"""
     empty_df = pd.DataFrame(columns=["广告主配置", "单价", "回传维度"])
     try:
         feishu_config = st.secrets["feishu"]
@@ -645,6 +646,192 @@ def render_dataframe(res_df, base_dims, wow_cols, table_key="default", insert_ow
     st.divider()
 
 
+def render_product_trend_chart(source_df, numeric_cols):
+    """按单一产品展示媒体堆叠量级与指标率双轴趋势"""
+    product_options = sorted(source_df["产品"].dropna().unique().tolist())
+    if not product_options:
+        return
+
+    st.subheader("产品趋势分析")
+    control_product, control_volume, control_rate = st.columns([1.2, 1, 1])
+    with control_product:
+        selected_product = st.selectbox("产品", product_options, key="chart_product")
+    with control_volume:
+        volume_options = ["不显示"] + [c for c in numeric_cols if c not in ("单价", "结算金额")]
+        default_volume = "广告主激活量" if "广告主激活量" in volume_options else "不显示"
+        selected_volume = st.selectbox(
+            "左轴量级", volume_options, index=volume_options.index(default_volume), key="chart_volume"
+        )
+    with control_rate:
+        rate_options = ["不显示"] + list(PRESET_RATES.keys())
+        default_rate = "下单率" if "下单率" in rate_options else "不显示"
+        selected_rate = st.selectbox(
+            "右轴指标率", rate_options, index=rate_options.index(default_rate), key="chart_rate"
+        )
+
+    reset_control, _ = st.columns([1, 5])
+    if reset_control.button("恢复全媒体总览", key="reset_product_chart"):
+        st.session_state["product_chart_revision"] = st.session_state.get("product_chart_revision", 0) + 1
+    chart_revision = st.session_state.get("product_chart_revision", 0)
+
+    product_df = source_df[source_df["产品"] == selected_product].copy()
+    product_df["日期"] = pd.to_datetime(product_df["日期"], errors="coerce").dt.normalize()
+    product_df = product_df.dropna(subset=["日期"])
+    if product_df.empty:
+        st.info("当前筛选条件下没有可用日期数据。")
+        return
+
+    dates = sorted(product_df["日期"].unique())
+    date_labels = [pd.Timestamp(date).strftime("%Y-%m-%d") for date in dates]
+    fig = go.Figure()
+    has_trace = False
+    if selected_volume != "不显示" and selected_volume in product_df.columns:
+        volume_df = product_df.groupby(["日期", "媒体平台名称"], as_index=False)[selected_volume].sum()
+        volume_df["日期标签"] = volume_df["日期"].dt.strftime("%Y-%m-%d")
+        totals_by_media = volume_df.groupby("媒体平台名称")[selected_volume].sum().sort_values(ascending=True)
+        media_order = totals_by_media.index.tolist()
+        media_index = {media: index for index, media in enumerate(media_order)}
+        traditional_blue_palette = [
+            "#f5f9fc", "#edf5fa", "#e4eff7", "#daeaf4", "#cfe3ef", "#c3dcea",
+            "#b5d4e5", "#a7ccdf", "#99c3d8", "#8bb9d0", "#7daec7", "#70a2bd",
+            "#6698b3", "#5d8da8", "#56829c", "#517891", "#4d6e85", "#49647a", "#455b70",
+        ]
+        palette_positions = np.linspace(0, len(traditional_blue_palette) - 1, max(len(media_order), 1)).round().astype(int)
+        media_palette = [traditional_blue_palette[position] for position in palette_positions]
+        daily_total = volume_df.groupby("日期标签")[selected_volume].sum().reindex(date_labels, fill_value=0)
+        show_volume_text = len(date_labels) <= 14
+
+        for media in media_order:
+            index = media_index[media]
+            media_df = volume_df[volume_df["媒体平台名称"] == media].set_index("日期标签")
+            values = media_df[selected_volume].reindex(date_labels, fill_value=0)
+            shares = np.where(daily_total.values > 0, values.values / daily_total.values * 100, 0)
+            fig.add_trace(go.Bar(
+                name=media,
+                x=date_labels,
+                y=values,
+                marker_color=media_palette[index],
+                legendgroup=f"media_{index}",
+                customdata=np.column_stack([shares]),
+                hovertemplate=(
+                    "日期 %{x}<br>媒体平台 <b><span style='color:#1565c0'>" + str(media) + "</span></b><br>" + selected_volume
+                    + " <b><span style='color:#1565c0'>%{y:,.0f}</span></b><br>媒体占比 <b><span style='color:#1565c0'>%{customdata[0]:.1f}%</span></b><extra></extra>"
+                ),
+            ))
+            if show_volume_text:
+                fig.add_trace(go.Scatter(
+                    name=f"{media} {selected_volume}",
+                    x=date_labels,
+                    y=values.values,
+                    mode="text",
+                    text=[f"{value:,.0f}" if value else "" for value in values.values],
+                    textposition="top center",
+                    textfont={"color": "#155a92", "size": 11},
+                    hoverinfo="skip",
+                    showlegend=False,
+                    legendgroup=f"media_{index}",
+                    visible="legendonly",
+                    cliponaxis=False,
+                ))
+        fig.update_yaxes(title_text=selected_volume, tickformat=",.0f")
+        has_trace = True
+
+    if selected_rate != "不显示":
+        numerator, denominator = PRESET_RATES[selected_rate]
+        if numerator in product_df.columns and denominator in product_df.columns:
+            rate_df = product_df.groupby("日期", as_index=False)[[numerator, denominator]].sum().sort_values("日期")
+            rate_numerator = pd.to_numeric(rate_df[numerator], errors="coerce").fillna(0)
+            if selected_rate == "次留率":
+                rate_numerator = rate_numerator.shift(-1).fillna(0)
+            elif selected_rate == "三留率":
+                rate_numerator = rate_numerator.shift(-3).fillna(0)
+            elif selected_rate == "七留率":
+                rate_numerator = rate_numerator.shift(-7).fillna(0)
+            rate_denominator = pd.to_numeric(rate_df[denominator], errors="coerce").fillna(0)
+            rate_values = np.where(rate_denominator != 0, rate_numerator / rate_denominator * 100, 0)
+            rate_by_date = pd.Series(rate_values, index=rate_df["日期"].dt.strftime("%Y-%m-%d"))
+            rate_values = rate_by_date.reindex(date_labels, fill_value=0).values
+            show_rate_text = len(date_labels) <= 12
+            fig.add_trace(go.Scatter(
+                name=f"产品整体{selected_rate}",
+                x=date_labels,
+                y=rate_values,
+                mode="lines+markers+text" if show_rate_text else "lines+markers",
+                text=[f"{value:.1f}%" for value in rate_values] if show_rate_text else None,
+                textposition="top center",
+                textfont={"color": "#d62728", "size": 11},
+                line={"color": "#e53935", "width": 3},
+                marker={"color": "#e53935", "size": 7},
+                hovertemplate="日期 %{x}<br>产品整体" + selected_rate + " <b><span style='color:#1565c0'>%{y:.2f}%</span></b><extra></extra>",
+                yaxis="y2",
+                showlegend=False,
+            ))
+            if selected_volume != "不显示" and "媒体平台名称" in product_df.columns:
+                for index, media in enumerate(media_order):
+                    media_rate_df = product_df[product_df["媒体平台名称"] == media].groupby(
+                        "日期", as_index=False
+                    )[[numerator, denominator]].sum().sort_values("日期")
+                    media_numerator = pd.to_numeric(media_rate_df[numerator], errors="coerce").fillna(0)
+                    if selected_rate == "次留率":
+                        media_numerator = media_numerator.shift(-1).fillna(0)
+                    elif selected_rate == "三留率":
+                        media_numerator = media_numerator.shift(-3).fillna(0)
+                    elif selected_rate == "七留率":
+                        media_numerator = media_numerator.shift(-7).fillna(0)
+                    media_denominator = pd.to_numeric(media_rate_df[denominator], errors="coerce").fillna(0)
+                    media_values = np.where(media_denominator != 0, media_numerator / media_denominator * 100, 0)
+                    media_rate_by_date = pd.Series(media_values, index=media_rate_df["日期"].dt.strftime("%Y-%m-%d"))
+                    media_values = media_rate_by_date.reindex(date_labels, fill_value=0).values
+                    fig.add_trace(go.Scatter(
+                        name=f"{media} {selected_rate}",
+                        x=date_labels,
+                        y=media_values,
+                        mode="lines+markers+text" if len(date_labels) <= 12 else "lines+markers",
+                        text=[f"{value:.1f}%" for value in media_values] if len(date_labels) <= 12 else None,
+                        textposition="bottom center",
+                        textfont={"color": "#101828", "size": 11},
+                        line={"color": "#111827", "width": 3, "dash": "dot"},
+                        marker={"color": "#ffffff", "size": 9, "line": {"color": "#111827", "width": 3}},
+                        hovertemplate="日期 %{x}<br>媒体平台 <b><span style='color:#1565c0'>" + str(media) + "</span></b><br>" + selected_rate + " <b><span style='color:#1565c0'>%{y:.2f}%</span></b><extra></extra>",
+                        yaxis="y2",
+                        legendgroup=f"media_{index}",
+                        showlegend=False,
+                        visible="legendonly",
+                    ))
+            fig.update_layout(yaxis2={"title": selected_rate, "overlaying": "y", "side": "right", "ticksuffix": "%", "showgrid": False})
+            has_trace = True
+        else:
+            st.warning(f"当前数据不含计算“{selected_rate}”所需的字段：{numerator}、{denominator}。")
+
+    if not has_trace:
+        st.info("请至少选择一个左轴量级或右轴指标率。")
+        return
+
+    fig.update_layout(
+        barmode="stack",
+        height=510,
+        margin={"l": 55, "r": 70, "t": 42, "b": 120},
+        hovermode="closest",
+        legend={
+            "orientation": "h", "yanchor": "top", "y": -0.23, "xanchor": "center", "x": 0.5,
+            "traceorder": "normal", "itemclick": "toggleothers", "itemdoubleclick": "toggle",
+            "groupclick": "togglegroup",
+        },
+        xaxis={"title": "日期", "type": "category", "categoryorder": "array", "categoryarray": date_labels, "tickangle": -35},
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#e8eef5", zeroline=False)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displaylogo": False, "responsive": True},
+        key=f"product_trend_chart_{chart_revision}",
+    )
+    st.caption("媒体按所选时间范围内的总量从小到大固定堆叠，小量级位于底部；悬停单个柱块或折线节点可查看对应数据与媒体占比。单击媒体图例可仅显示该媒体的量级柱、柱顶量级及对应指标率虚线；点击“恢复全媒体总览”后，仅保留产品整体指标率红线。")
+
+
 # ====================== 页面初始化 ======================
 st.set_page_config(page_title="OCPX业务数据全维度分析看板", layout="wide", initial_sidebar_state="expanded")
 st.markdown("<h2 style='text-align: center; color: #1F77B4;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
@@ -751,7 +938,7 @@ if st.session_state["cleaned_data"] is not None:
         with st.sidebar:
             st.markdown("<h3 style='color: #1F77B4;'>💰 飞书配置</h3>", unsafe_allow_html=True)
             df_price_config = load_feishu_price_config()
-            st.caption(f"飞书单价配置已加载 {len(df_price_config)} 条（5分钟自动刷新）")
+            st.caption(f"飞书单价配置已加载 {len(df_price_config)} 条（每天自动刷新）")
             if not df_price_config.empty:
                 with st.expander("🔍 飞书配置预览（前5条）"):
                     st.dataframe(df_price_config.head(), use_container_width=True, hide_index=True)
@@ -971,6 +1158,8 @@ if st.session_state["cleaned_data"] is not None:
             },
         }
         view = view_options[selected_view]
+        if selected_view == "产品明细":
+            render_product_trend_chart(f_df_global, numeric_cols)
         st.caption("切换时仅计算当前视图，可减少大数据量下的等待时间。")
         st.subheader(view["title"])
         result, wow_cols = process_view(
