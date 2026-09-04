@@ -6,13 +6,6 @@ import os
 import re
 import shutil
 import datetime
-import base64
-import binascii
-import hashlib
-import hmac
-import secrets
-import time
-from urllib.parse import urlencode
 import extra_streamlit_components as stx
 import requests
 
@@ -74,106 +67,22 @@ def clean_name(x, default="未知"):
     return s.split('_', 1)[-1] if '_' in s else s
 
 
-def _create_signed_value(value, app_secret, valid_seconds):
-    expires_at = int(time.time()) + valid_seconds
-    payload = f"{value}:{expires_at}"
-    signature = hmac.new(app_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
-
-
-def _create_login_token(open_id, app_secret):
-    return _create_signed_value(open_id, app_secret, 7 * 24 * 60 * 60)
-
-
-def _get_login_open_id(login_token, app_secret):
-    try:
-        payload, signature = base64.urlsafe_b64decode(login_token.encode()).decode().rsplit(":", 1)
-        open_id, expires_at = payload.rsplit(":", 1)
-        expected_signature = hmac.new(app_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if hmac.compare_digest(signature, expected_signature) and int(expires_at) >= time.time():
-            return open_id
-    except (ValueError, UnicodeDecodeError, binascii.Error):
-        pass
-    return None
-
-
-def get_feishu_user_id(cookie_manager):
-    if "feishu_open_id" in st.session_state:
-        return st.session_state["feishu_open_id"]
-
-    feishu_config = st.secrets.get("feishu", {})
-    app_id = feishu_config.get("app_id")
-    app_secret = feishu_config.get("app_secret")
-    redirect_uri = feishu_config.get("oauth_redirect_uri")
-    if not all([app_id, app_secret, redirect_uri]):
-        st.error("飞书登录配置不完整，请在 Streamlit Secrets 的 [feishu] 中配置 app_id、app_secret 和 oauth_redirect_uri。")
-        st.stop()
-
-    saved_open_id = _get_login_open_id(cookie_manager.get("feishu_login"), app_secret) if cookie_manager.get("feishu_login") else None
-    if saved_open_id:
-        st.session_state["feishu_open_id"] = saved_open_id
-        return saved_open_id
-
-    code = st.query_params.get("code")
-    state = st.query_params.get("state")
-    if code:
-        if not state or not _get_login_open_id(state, app_secret):
-            st.error("飞书登录校验失败，请重新登录。")
-            st.stop()
-        try:
-            token_res = requests.post(
-                "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
-                json={
-                    "grant_type": "authorization_code",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "code": code,
-                    "redirect_uri": redirect_uri
-                },
-                timeout=30
-            )
-            token_data = token_res.json()
-            access_token = token_data.get("access_token")
-            if token_data.get("code") != 0 or not access_token:
-                raise ValueError(token_data.get("msg", "未能获取用户授权令牌"))
-            user_res = requests.get(
-                "https://open.feishu.cn/open-apis/authen/v1/user_info",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=30
-            )
-            user_data = user_res.json()
-            open_id = user_data.get("data", {}).get("open_id") or user_data.get("open_id")
-            if user_data.get("code") != 0 or not open_id:
-                raise ValueError(user_data.get("msg", "未能获取用户身份"))
-        except (requests.RequestException, ValueError) as e:
-            st.error(f"飞书登录失败: {e}")
-            st.stop()
-
+def get_or_create_session_id(cookie_manager):
+    if "session_id" in st.session_state:
+        return st.session_state["session_id"]
+    session_id = cookie_manager.get("session_id")
+    if not session_id:
+        session_id = uuid.uuid4().hex
         cookie_manager.set(
-            "feishu_login", _create_login_token(open_id, app_secret),
-            expires_at=datetime.datetime.now() + datetime.timedelta(days=7)
+            "session_id", session_id,
+            expires_at=datetime.datetime.now() + datetime.timedelta(days=30)
         )
-        st.session_state["feishu_open_id"] = open_id
-        st.query_params.clear()
-        st.rerun()
-
-    oauth_state = _create_signed_value(secrets.token_urlsafe(32), app_secret, 10 * 60)
-    login_url = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + urlencode({
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": "auth:user.id:read",
-        "state": oauth_state
-    })
-    st.markdown("<h2 style='text-align: center; color: #1F77B4;'>OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
-    st.info("请先使用飞书账号登录后再访问看板。")
-    st.link_button("使用飞书登录", login_url, use_container_width=True)
-    st.stop()
+    st.session_state["session_id"] = session_id
+    return session_id
 
 
-def _user_dir(user_id):
-    return os.path.join(UPLOADED_DIR, user_id)
-
+def _user_dir(session_id):
+    return os.path.join(UPLOADED_DIR, session_id)
 @st.cache_data(show_spinner=True, ttl=300)
 def load_feishu_price_config():
     """读取飞书多维表格配置，缓存5分钟自动刷新"""
@@ -743,13 +652,12 @@ if "cleaned_data" not in st.session_state:
     st.session_state["cleaned_data"] = None
     st.session_state["file_name"] = None
 
-user_id = get_feishu_user_id(cookie_manager)
-last_file_cookie = f"last_uploaded_file_{user_id}"
+session_id = get_or_create_session_id(cookie_manager)
 
 if st.session_state["cleaned_data"] is None:
-    last_file = cookie_manager.get(last_file_cookie)
+    last_file = cookie_manager.get("last_uploaded_file")
     if last_file:
-        file_path = os.path.join(_user_dir(user_id), last_file)
+        file_path = os.path.join(_user_dir(session_id), last_file)
         if os.path.exists(file_path):
             try:
                 with open(file_path, "rb") as f:
@@ -765,10 +673,10 @@ with col_upload:
 with col_clear:
     st.write("#")
     if st.button("🗑️ 清除缓存数据", use_container_width=True):
-        user_dir = _user_dir(user_id)
+        user_dir = _user_dir(session_id)
         if os.path.exists(user_dir):
             shutil.rmtree(user_dir, ignore_errors=True)
-        cookie_manager.delete(last_file_cookie)
+        cookie_manager.delete("last_uploaded_file")
         st.cache_data.clear()
         st.session_state["cleaned_data"] = None
         st.session_state["file_name"] = None
@@ -778,7 +686,7 @@ if uploaded_file:
     if st.session_state["file_name"] != uploaded_file.name:
         with st.status("🚀 正在清洗大盘数据...", expanded=True) as status:
             file_bytes = uploaded_file.read()
-            user_dir = _user_dir(user_id)
+            user_dir = _user_dir(session_id)
             if os.path.exists(user_dir):
                 shutil.rmtree(user_dir, ignore_errors=True)
             os.makedirs(user_dir, exist_ok=True)
@@ -787,7 +695,7 @@ if uploaded_file:
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
             cookie_manager.set(
-                last_file_cookie, file_name,
+                "last_uploaded_file", file_name,
                 expires_at=datetime.datetime.now() + datetime.timedelta(days=7)
             )
             df_cleaned = load_and_clean_data_cached(file_bytes, file_name)
