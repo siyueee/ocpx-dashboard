@@ -4,8 +4,13 @@ import numpy as np
 import json
 import os
 import re
+import uuid
+import shutil
+import datetime
 import extra_streamlit_components as stx
 import requests
+
+UPLOADED_DIR = "uploaded_files"
 
 # ====================== 全局常量 ======================
 TARGET_MAP = {
@@ -62,6 +67,23 @@ def clean_name(x, default="未知"):
     if s == "" or s.lower() == "nan": return default
     return s.split('_', 1)[-1] if '_' in s else s
 
+
+def get_or_create_session_id(cookie_manager):
+    if "session_id" in st.session_state:
+        return st.session_state["session_id"]
+    session_id = cookie_manager.get("session_id")
+    if not session_id:
+        session_id = uuid.uuid4().hex
+        cookie_manager.set(
+            "session_id", session_id,
+            expires_at=datetime.datetime.now() + datetime.timedelta(days=30)
+        )
+    st.session_state["session_id"] = session_id
+    return session_id
+
+
+def _user_dir(session_id):
+    return os.path.join(UPLOADED_DIR, session_id)
 
 @st.cache_data(show_spinner=True, ttl=300)
 def load_feishu_price_config():
@@ -632,12 +654,31 @@ if "cleaned_data" not in st.session_state:
     st.session_state["cleaned_data"] = None
     st.session_state["file_name"] = None
 
+session_id = get_or_create_session_id(cookie_manager)
+
+if st.session_state["cleaned_data"] is None:
+    last_file = cookie_manager.get("last_uploaded_file")
+    if last_file:
+        file_path = os.path.join(_user_dir(session_id), last_file)
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    file_bytes = f.read()
+                st.session_state["cleaned_data"] = load_and_clean_data_cached(file_bytes, last_file)
+                st.session_state["file_name"] = last_file
+            except Exception:
+                pass
+
 col_upload, col_clear = st.columns([4, 1])
 with col_upload:
     uploaded_file = st.file_uploader("📥 上传原始报表数据 (支持 .xlsx / .csv)", type=["csv", "xlsx"])
 with col_clear:
     st.write("#")
     if st.button("🗑️ 清除缓存数据", use_container_width=True):
+        user_dir = _user_dir(session_id)
+        if os.path.exists(user_dir):
+            shutil.rmtree(user_dir, ignore_errors=True)
+        cookie_manager.delete("last_uploaded_file")
         st.cache_data.clear()
         st.session_state["cleaned_data"] = None
         st.session_state["file_name"] = None
@@ -647,6 +688,15 @@ if uploaded_file:
     if st.session_state["file_name"] != uploaded_file.name:
         with st.status("🚀 正在清洗大盘数据...", expanded=True) as status:
             file_bytes = uploaded_file.read()
+            user_dir = _user_dir(session_id)
+            os.makedirs(user_dir, exist_ok=True)
+            file_path = os.path.join(user_dir, uploaded_file.name)
+            with open(file_path, "wb") as f:
+                f.write(file_bytes)
+            cookie_manager.set(
+                "last_uploaded_file", uploaded_file.name,
+                expires_at=datetime.datetime.now() + datetime.timedelta(days=7)
+            )
             df_cleaned = load_and_clean_data_cached(file_bytes, uploaded_file.name)
             st.session_state["cleaned_data"] = df_cleaned
             st.session_state["file_name"] = uploaded_file.name
