@@ -74,11 +74,15 @@ def clean_name(x, default="未知"):
     return s.split('_', 1)[-1] if '_' in s else s
 
 
-def _create_login_token(open_id, app_secret):
-    expires_at = int(time.time()) + 7 * 24 * 60 * 60
-    payload = f"{open_id}:{expires_at}"
+def _create_signed_value(value, app_secret, valid_seconds):
+    expires_at = int(time.time()) + valid_seconds
+    payload = f"{value}:{expires_at}"
     signature = hmac.new(app_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _create_login_token(open_id, app_secret):
+    return _create_signed_value(open_id, app_secret, 7 * 24 * 60 * 60)
 
 
 def _get_login_open_id(login_token, app_secret):
@@ -113,8 +117,7 @@ def get_feishu_user_id(cookie_manager):
     code = st.query_params.get("code")
     state = st.query_params.get("state")
     if code:
-        expected_state = cookie_manager.get("feishu_oauth_state")
-        if not expected_state or not state or not secrets.compare_digest(state, expected_state):
+        if not state or not _get_login_open_id(state, app_secret):
             st.error("飞书登录校验失败，请重新登录。")
             st.stop()
         try:
@@ -130,7 +133,7 @@ def get_feishu_user_id(cookie_manager):
                 timeout=30
             )
             token_data = token_res.json()
-            access_token = token_data.get("data", {}).get("access_token")
+            access_token = token_data.get("access_token")
             if token_data.get("code") != 0 or not access_token:
                 raise ValueError(token_data.get("msg", "未能获取用户授权令牌"))
             user_res = requests.get(
@@ -139,14 +142,13 @@ def get_feishu_user_id(cookie_manager):
                 timeout=30
             )
             user_data = user_res.json()
-            open_id = user_data.get("data", {}).get("open_id")
+            open_id = user_data.get("data", {}).get("open_id") or user_data.get("open_id")
             if user_data.get("code") != 0 or not open_id:
                 raise ValueError(user_data.get("msg", "未能获取用户身份"))
         except (requests.RequestException, ValueError) as e:
             st.error(f"飞书登录失败: {e}")
             st.stop()
 
-        cookie_manager.delete("feishu_oauth_state")
         cookie_manager.set(
             "feishu_login", _create_login_token(open_id, app_secret),
             expires_at=datetime.datetime.now() + datetime.timedelta(days=7)
@@ -155,14 +157,12 @@ def get_feishu_user_id(cookie_manager):
         st.query_params.clear()
         st.rerun()
 
-    oauth_state = secrets.token_urlsafe(32)
-    cookie_manager.set(
-        "feishu_oauth_state", oauth_state,
-        expires_at=datetime.datetime.now() + datetime.timedelta(minutes=10)
-    )
-    login_url = "https://open.feishu.cn/open-apis/authen/v1/authorize?" + urlencode({
-        "app_id": app_id,
+    oauth_state = _create_signed_value(secrets.token_urlsafe(32), app_secret, 10 * 60)
+    login_url = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + urlencode({
+        "client_id": app_id,
         "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "auth:user.id:read",
         "state": oauth_state
     })
     st.markdown("<h2 style='text-align: center; color: #1F77B4;'>OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
