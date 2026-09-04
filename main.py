@@ -689,6 +689,8 @@ if uploaded_file:
         with st.status("🚀 正在清洗大盘数据...", expanded=True) as status:
             file_bytes = uploaded_file.read()
             user_dir = _user_dir(session_id)
+            if os.path.exists(user_dir):
+                shutil.rmtree(user_dir, ignore_errors=True)
             os.makedirs(user_dir, exist_ok=True)
             file_path = os.path.join(user_dir, uploaded_file.name)
             with open(file_path, "wb") as f:
