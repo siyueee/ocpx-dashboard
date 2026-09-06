@@ -652,7 +652,8 @@ def render_product_trend_chart(source_df, numeric_cols):
     if not product_options:
         return
 
-    st.subheader("产品趋势分析")
+    st.markdown("<div class='trend-section-title'>产品趋势分析</div>", unsafe_allow_html=True)
+    st.markdown("<div class='trend-section-hint'>选择产品、观察量级和转化率，快速查看每日媒体贡献与整体变化。</div>", unsafe_allow_html=True)
     control_product, control_volume, control_rate = st.columns([1.2, 1, 1])
     with control_product:
         selected_product = st.selectbox("产品", product_options, key="chart_product")
@@ -669,7 +670,7 @@ def render_product_trend_chart(source_df, numeric_cols):
             "右轴指标率", rate_options, index=rate_options.index(default_rate), key="chart_rate"
         )
 
-    reset_control, _ = st.columns([1, 5])
+    reset_control, _ = st.columns([1.3, 4.7])
     if reset_control.button("恢复全媒体总览", key="reset_product_chart"):
         st.session_state["product_chart_revision"] = st.session_state.get("product_chart_revision", 0) + 1
     chart_revision = st.session_state.get("product_chart_revision", 0)
@@ -687,52 +688,86 @@ def render_product_trend_chart(source_df, numeric_cols):
     has_trace = False
     if selected_volume != "不显示" and selected_volume in product_df.columns:
         volume_df = product_df.groupby(["日期", "媒体平台名称"], as_index=False)[selected_volume].sum()
+        advertiser_volume_df = (
+            product_df.groupby(
+                ["日期", "媒体平台名称", "广告主平台名称"],
+                as_index=False,
+            )[selected_volume]
+            .sum()
+            .sort_values(selected_volume, ascending=False)
+        )
+        advertiser_volume_df["_媒体总转化量"] = advertiser_volume_df.groupby(
+            ["日期", "媒体平台名称"]
+        )[selected_volume].transform("sum")
+        advertiser_hover_by_date_media = (
+            advertiser_volume_df.assign(
+                广告主转化量=lambda df: df.apply(
+                    lambda row: (
+                        f"<b>{row['广告主平台名称']}：{row[selected_volume]:,.0f}</b>"
+                        f" | <span style='color:#5D9A83'><b>{row[selected_volume] / row['_媒体总转化量'] * 100:.1f}%</b></span>"
+                        if row["_媒体总转化量"] > 0
+                        else " | <span style='color:#5D9A83'><b>0.0%</b></span>"
+                    ),
+                    axis=1,
+                )
+            )
+            .groupby(["日期", "媒体平台名称"])["广告主转化量"]
+            .agg("<br>".join)
+        )
         volume_df["日期标签"] = volume_df["日期"].dt.strftime("%Y-%m-%d")
         totals_by_media = volume_df.groupby("媒体平台名称")[selected_volume].sum().sort_values(ascending=True)
         media_order = totals_by_media.index.tolist()
         media_index = {media: index for index, media in enumerate(media_order)}
-        traditional_blue_palette = [
-            "#f5f9fc", "#edf5fa", "#e4eff7", "#daeaf4", "#cfe3ef", "#c3dcea",
-            "#b5d4e5", "#a7ccdf", "#99c3d8", "#8bb9d0", "#7daec7", "#70a2bd",
-            "#6698b3", "#5d8da8", "#56829c", "#517891", "#4d6e85", "#49647a", "#455b70",
+        media_palette = [
+            "#AFC8E6", "#B8DEC9", "#F4C99B", "#DDB5D5", "#B9D2E3", "#E5D29B",
+            "#C5DCAF", "#E8B8B1", "#C9BCE3", "#AEE0DD", "#DCC6A9", "#DDB8CC",
+            "#B9D5C1", "#E6C3C3", "#B6D2DC", "#DDD29D", "#D6C0AE", "#BBC6E2",
+            "#B9DCCF", "#E5B8CB", "#CED7AC", "#D3C1DE", "#B1D3D7", "#E5C7A8",
         ]
-        palette_positions = np.linspace(0, len(traditional_blue_palette) - 1, max(len(media_order), 1)).round().astype(int)
-        media_palette = [traditional_blue_palette[position] for position in palette_positions]
         daily_total = volume_df.groupby("日期标签")[selected_volume].sum().reindex(date_labels, fill_value=0)
-        show_volume_text = len(date_labels) <= 14
+        show_media_value_labels = len(media_order) == 1
 
         for media in media_order:
             index = media_index[media]
             media_df = volume_df[volume_df["媒体平台名称"] == media].set_index("日期标签")
             values = media_df[selected_volume].reindex(date_labels, fill_value=0)
             shares = np.where(daily_total.values > 0, values.values / daily_total.values * 100, 0)
+            advertiser_details = [
+                advertiser_hover_by_date_media.get(
+                    (pd.Timestamp(date_label), media),
+                    "<b>暂无广告主数据</b>",
+                )
+                for date_label in date_labels
+            ]
             fig.add_trace(go.Bar(
                 name=media,
                 x=date_labels,
                 y=values,
-                marker_color=media_palette[index],
+                marker={"color": media_palette[index % len(media_palette)], "line": {"color": "#FFFFFF", "width": 0.8}},
+                text=[f"{value:,.0f}" if show_media_value_labels and value else "" for value in values.values],
+                textposition="outside" if show_media_value_labels else "none",
+                textfont={"color": "#42627B", "size": 11},
+                cliponaxis=False,
                 legendgroup=f"media_{index}",
-                customdata=np.column_stack([shares]),
+                customdata=np.column_stack([shares, advertiser_details]),
                 hovertemplate=(
-                    "日期 %{x}<br>媒体平台 <b><span style='color:#1565c0'>" + str(media) + "</span></b><br>" + selected_volume
-                    + " <b><span style='color:#1565c0'>%{y:,.0f}</span></b><br>媒体占比 <b><span style='color:#1565c0'>%{customdata[0]:.1f}%</span></b><extra></extra>"
+                    "日期 %{x}<br>媒体平台 <b><span style='color:#315C76'>" + str(media) + "</span></b><br><br>" + selected_volume
+                    + " <b><span style='color:#315C76'>%{y:,.0f}</span></b><br>媒体占比 <b><span style='color:#315C76'>%{customdata[0]:.1f}%</span></b><br><br>%{customdata[1]}<extra></extra>"
                 ),
             ))
-            if show_volume_text:
-                fig.add_trace(go.Scatter(
-                    name=f"{media} {selected_volume}",
-                    x=date_labels,
-                    y=values.values,
-                    mode="text",
-                    text=[f"{value:,.0f}" if value else "" for value in values.values],
-                    textposition="top center",
-                    textfont={"color": "#155a92", "size": 11},
-                    hoverinfo="skip",
-                    showlegend=False,
-                    legendgroup=f"media_{index}",
-                    visible="legendonly",
-                    cliponaxis=False,
-                ))
+        if not show_media_value_labels and len(date_labels) <= 14:
+            fig.add_trace(go.Scatter(
+                name=f"每日总{selected_volume}",
+                x=date_labels,
+                y=daily_total.values,
+                mode="text",
+                text=[f"{value:,.0f}" if value else "" for value in daily_total.values],
+                textposition="top center",
+                textfont={"color": "#42627B", "size": 11},
+                hoverinfo="skip",
+                showlegend=False,
+                cliponaxis=False,
+            ))
         fig.update_yaxes(title_text=selected_volume, tickformat=",.0f")
         has_trace = True
 
@@ -759,10 +794,10 @@ def render_product_trend_chart(source_df, numeric_cols):
                 mode="lines+markers+text" if show_rate_text else "lines+markers",
                 text=[f"{value:.1f}%" for value in rate_values] if show_rate_text else None,
                 textposition="top center",
-                textfont={"color": "#d62728", "size": 11},
-                line={"color": "#e53935", "width": 3},
-                marker={"color": "#e53935", "size": 7},
-                hovertemplate="日期 %{x}<br>产品整体" + selected_rate + " <b><span style='color:#1565c0'>%{y:.2f}%</span></b><extra></extra>",
+                textfont={"color": "#B86A84", "size": 11},
+                line={"color": "#C9829A", "width": 3},
+                marker={"color": "#FFFFFF", "size": 8, "line": {"color": "#C9829A", "width": 3}},
+                hovertemplate="日期 %{x}<br>产品整体" + selected_rate + " <b><span style='color:#B86A84'>%{y:.2f}%</span></b><extra></extra>",
                 yaxis="y2",
                 showlegend=False,
             ))
@@ -789,10 +824,10 @@ def render_product_trend_chart(source_df, numeric_cols):
                         mode="lines+markers+text" if len(date_labels) <= 12 else "lines+markers",
                         text=[f"{value:.1f}%" for value in media_values] if len(date_labels) <= 12 else None,
                         textposition="bottom center",
-                        textfont={"color": "#101828", "size": 11},
-                        line={"color": "#111827", "width": 3, "dash": "dot"},
-                        marker={"color": "#ffffff", "size": 9, "line": {"color": "#111827", "width": 3}},
-                        hovertemplate="日期 %{x}<br>媒体平台 <b><span style='color:#1565c0'>" + str(media) + "</span></b><br>" + selected_rate + " <b><span style='color:#1565c0'>%{y:.2f}%</span></b><extra></extra>",
+                        textfont={"color": media_palette[index % len(media_palette)], "size": 11},
+                        line={"color": media_palette[index % len(media_palette)], "width": 3, "dash": "dot"},
+                        marker={"color": "#FFFFFF", "size": 9, "line": {"color": media_palette[index % len(media_palette)], "width": 3}},
+                        hovertemplate="日期 %{x}<br>媒体平台 <b><span style='color:#315C76'>" + str(media) + "</span></b><br>" + selected_rate + " <b><span style='color:#315C76'>%{y:.2f}%</span></b><extra></extra>",
                         yaxis="y2",
                         legendgroup=f"media_{index}",
                         showlegend=False,
@@ -818,11 +853,11 @@ def render_product_trend_chart(source_df, numeric_cols):
             "groupclick": "togglegroup",
         },
         xaxis={"title": "日期", "type": "category", "categoryorder": "array", "categoryarray": date_labels, "tickangle": -35},
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
+        plot_bgcolor="#FCFDFE",
+        paper_bgcolor="#FCFDFE",
     )
     fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="#e8eef5", zeroline=False)
+    fig.update_yaxes(gridcolor="#E3EBEF", zeroline=False)
     st.plotly_chart(
         fig,
         use_container_width=True,
@@ -834,40 +869,103 @@ def render_product_trend_chart(source_df, numeric_cols):
 
 # ====================== 页面初始化 ======================
 st.set_page_config(page_title="OCPX业务数据全维度分析看板", layout="wide", initial_sidebar_state="expanded")
-st.markdown("<h2 style='text-align: center; color: #1F77B4;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; color: #666;'>欢迎提出使用建议~🍦</p>", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align: center; color: #23465F;'>🥑 OCPX 业务数据分析看板</h2>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #718394;'>欢迎提出使用建议~🍦</p>", unsafe_allow_html=True)
 
 st.markdown("""
 <style>
+:root {
+    --mist-blue: #4F819D;
+    --mist-blue-dark: #23465F;
+    --mist-blue-muted: #718394;
+    --mist-blue-pale: #F4F8FA;
+    --mist-blue-border: #D8E4EA;
+}
+[data-testid="stAppViewContainer"] { background: #FAFCFD; }
+[data-testid="stSidebar"] { background: #F6F9FB; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 { color: #315C76 !important; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] { border-color: #D8E4EA; }
+[data-testid="stSelectbox"] > div > div, [data-testid="stMultiSelect"] > div > div, [data-testid="stDateInput"] input, [data-testid="stNumberInput"] input {
+    border-color: #D8E4EA !important;
+    background: #FFFFFF !important;
+}
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
+    border-color: #C8D9E3;
+    color: #315C76;
+    background: #FFFFFF;
+}
+[data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover {
+    border-color: #7FA5B9;
+    color: #23465F;
+    background: #F1F7FA;
+}
 .view-switch-label {
-    color: #1F77B4;
-    font-size: 1.1rem;
+    color: #163B5C;
+    font-size: 1.2rem;
     font-weight: 700;
+    letter-spacing: 0;
+    margin: 1.6rem 0 0.15rem;
+}
+.view-switch-hint {
+    color: #7A8B9A;
+    font-size: 0.84rem;
+    margin: 0 0 0.8rem;
+}
+.view-step-label {
+    color: #78909F;
+    font-size: 0.78rem;
+    font-weight: 600;
     letter-spacing: 0.02em;
-    margin: 1.25rem 0 0.25rem;
+    margin: 0 0 0.35rem;
 }
 .st-key-view_tab_product button, .st-key-view_tab_config button, .st-key-view_tab_media button, .st-key-view_tab_dispatch button {
-    min-height: 3.15rem;
-    border-radius: 0.75rem;
-    border: 1px solid #d8e6f5;
-    background: #f7fbff;
-    color: #3d607c;
+    min-height: 3.45rem;
+    border-radius: 0.65rem;
+    border: 1px solid #DCE8F2;
+    background: #FFFFFF;
+    color: #42627B;
     font-weight: 650;
     transition: all 0.18s ease;
 }
 .st-key-view_tab_product button:hover, .st-key-view_tab_config button:hover, .st-key-view_tab_media button:hover, .st-key-view_tab_dispatch button:hover {
-    border-color: #78afe0;
-    background: #edf6ff;
+    border-color: #8CB9D9;
+    background: #F4FAFE;
     color: #1F77B4;
-    transform: translateY(-1px);
+    transform: translateY(-2px);
 }
 .st-key-view_tab_product button[kind="primary"], .st-key-view_tab_config button[kind="primary"], .st-key-view_tab_media button[kind="primary"], .st-key-view_tab_dispatch button[kind="primary"] {
-    border-color: #1F77B4;
-    background: linear-gradient(135deg, #1F77B4, #3293d0);
+    border-color: #2E86C1;
+    background: linear-gradient(135deg, #4F819D, #76A2B9);
     color: #ffffff;
-    box-shadow: 0 5px 14px rgba(31, 119, 180, 0.2);
+    box-shadow: 0 6px 16px rgba(79, 129, 157, 0.18);
 }
-</style>
+div[data-testid="stMetric"] {
+    background: linear-gradient(145deg, #FFFFFF, #F7FBFE);
+    border: 1px solid #E0EBF3;
+    border-radius: 0.8rem;
+    padding: 0.85rem 1rem;
+    min-height: 6.9rem;
+    box-shadow: 0 3px 10px rgba(34, 84, 120, 0.05);
+}
+div[data-testid="stMetricLabel"] {
+    color: #52708A;
+    font-size: 0.88rem;
+}
+div[data-testid="stMetricValue"] {
+    color: #173B59;
+}
+.trend-section-title {
+    color: #173B59;
+    font-size: 1.35rem;
+    font-weight: 750;
+    margin: 1.6rem 0 0.18rem;
+}
+.trend-section-hint {
+    color: #7A8B9A;
+    font-size: 0.86rem;
+    margin-bottom: 0.85rem;
+}
+}
 """, unsafe_allow_html=True)
 st.divider()
 
@@ -936,7 +1034,7 @@ if st.session_state["cleaned_data"] is not None:
         st.caption(f"💾 当前使用数据源: `{st.session_state['file_name']}`")
 
         with st.sidebar:
-            st.markdown("<h3 style='color: #1F77B4;'>💰 飞书配置</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color: #315C76;'>💰 飞书配置</h3>", unsafe_allow_html=True)
             df_price_config = load_feishu_price_config()
             st.caption(f"飞书单价配置已加载 {len(df_price_config)} 条（每天自动刷新）")
             if not df_price_config.empty:
@@ -961,13 +1059,13 @@ if st.session_state["cleaned_data"] is not None:
 
         # ====================== 侧边栏控件 ======================
         with st.sidebar:
-            st.markdown("<h3 style='color: #1F77B4;'>📅 时间周期</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color: #315C76;'>📅 时间周期</h3>", unsafe_allow_html=True)
             valid_dates = df['日期'].dropna()
             min_d, max_d = (valid_dates.min(), valid_dates.max()) if not valid_dates.empty else (None, None)
             selected_date_range = st.date_input("选择周期范围", value=(min_d, max_d))
             st.divider()
 
-            st.markdown("<h3 style='color: #1F77B4;'>🔍 漏斗筛选</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color: #315C76;'>🔍 漏斗筛选</h3>", unsafe_allow_html=True)
             faction_options = sorted(df["派系"].unique().tolist())
             select_all_factions = st.checkbox("🔗 全选所有派系", value=False)
             t_factions = st.multiselect("1. 派系筛选", options=faction_options,
@@ -995,7 +1093,7 @@ if st.session_state["cleaned_data"] is not None:
             t_owners = st.multiselect("7. 负责人筛选", options=sorted(sub_df_for_owner["负责人"].unique().tolist()))
 
             st.divider()
-            st.markdown("<h3 style='color: #1F77B4;'>📈 率指标池</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color: #315C76;'>📈 率指标池</h3>", unsafe_allow_html=True)
             selected_rate_names = []
             col1, col2 = st.columns(2)
             for i, name in enumerate(PRESET_RATES.keys()):
@@ -1061,7 +1159,7 @@ if st.session_state["cleaned_data"] is not None:
                 active_kpi_pool = [{"name": c, "type": "number"}
                                    for c in ["广告主激活量", "下单量", "新登量"] if c in f_df_global.columns]
 
-            kpi_cols = st.columns(min(len(active_kpi_pool), 4))
+            kpi_cols = st.columns(min(len(active_kpi_pool), 4), gap="medium")
             for idx, kpi in enumerate(active_kpi_pool[:4]):
                 name, kpi_type = kpi["name"], kpi["type"]
                 with kpi_cols[idx]:
@@ -1090,12 +1188,13 @@ if st.session_state["cleaned_data"] is not None:
                         else:
                             rate_val = 0.0
                         st.metric(label=f"📈 大盘综合 {name}", value=f"{rate_val:.2f}%")
-            st.write("")
+            st.markdown("<div style='height: 0.55rem;'></div>", unsafe_allow_html=True)
 
         if "selected_view" not in st.session_state:
             st.session_state["selected_view"] = "配置号明细"
 
         st.markdown("<div class='view-switch-label'>明细分析视图</div>", unsafe_allow_html=True)
+        st.markdown("<div class='view-switch-hint'>按分析粒度切换。产品明细包含趋势图，其余视图用于逐层下钻定位。</div>", unsafe_allow_html=True)
         view_options = [
             ("产品明细", "view_tab_product", "① 产品明细", "产品与日期"),
             ("配置号明细", "view_tab_config", "② 配置号明细", "配置号维度"),
@@ -1105,7 +1204,7 @@ if st.session_state["cleaned_data"] is not None:
         tab_columns = st.columns(4, gap="small")
         for column, (label, key, button_label, description) in zip(tab_columns, view_options):
             with column:
-                st.caption(description)
+                st.markdown(f"<div class='view-step-label'>{description}</div>", unsafe_allow_html=True)
                 if st.button(
                     button_label,
                     key=key,
